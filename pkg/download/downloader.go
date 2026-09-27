@@ -174,6 +174,7 @@ func (d *Downloader) Setup() error {
 			})
 		}
 	}
+	d.applyProtocolConfig()
 
 	// load tasks from storage
 	var tasks []*Task
@@ -951,7 +952,19 @@ func (d *Downloader) GetConfig() (*base.DownloaderStoreConfig, error) {
 
 func (d *Downloader) PutConfig(v *base.DownloaderStoreConfig) error {
 	d.cfg.DownloaderStoreConfig = v
+	d.applyProtocolConfig()
 	return d.storage.Put(bucketConfig, "config", v)
+}
+
+func (d *Downloader) applyProtocolConfig() {
+	for _, fm := range d.cfg.FetchManagers {
+		if cfm, ok := fm.(fetcher.ConfigurableFetcherManager); ok {
+			name := fm.Name()
+			cfm.ApplyConfig(func(v any) {
+				d.getProtocolConfig(name, v)
+			})
+		}
+	}
 }
 
 func (d *Downloader) getProtocolConfig(name string, v any) bool {
