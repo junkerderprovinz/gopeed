@@ -51,6 +51,8 @@ func NewTask() *Task {
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 		IsCreated: false,
+
+		statusLock: &sync.Mutex{},
 	}
 }
 
@@ -100,7 +102,22 @@ func (t *Task) updateStatus(status base.Status) {
 	t.Status = status
 }
 
+func (t *Task) getStatus() base.Status {
+	t.statusLock.Lock()
+	defer t.statusLock.Unlock()
+	return t.Status
+}
+
+func (t *Task) setStatus(status base.Status) {
+	t.statusLock.Lock()
+	defer t.statusLock.Unlock()
+	t.Status = status
+}
+
+// clone takes statusLock, so it must not be called while holding it.
 func (t *Task) clone() *Task {
+	t.statusLock.Lock()
+	defer t.statusLock.Unlock()
 	return util.DeepClone(t)
 }
 

@@ -718,7 +718,9 @@ type ExtensionTask struct {
 func NewExtensionTask(download *Downloader, task *Task) *ExtensionTask {
 	// restricts extension scripts to only modify request info
 	newTask := task.clone()
+	task.statusLock.Lock()
 	newTask.Meta.Req = task.Meta.Req
+	task.statusLock.Unlock()
 	return &ExtensionTask{
 		download: download,
 		Task:     newTask,

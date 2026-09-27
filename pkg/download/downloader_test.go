@@ -2,10 +2,12 @@ package download
 
 import (
 	"archive/zip"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
 	gohttp "net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/GopeedLab/gopeed/internal/fetcher"
 	"github.com/GopeedLab/gopeed/internal/protocol/bt"
+	ihttp "github.com/GopeedLab/gopeed/internal/protocol/http"
 	"github.com/GopeedLab/gopeed/internal/test"
 	"github.com/GopeedLab/gopeed/pkg/base"
 	"github.com/GopeedLab/gopeed/pkg/protocol/http"
@@ -946,6 +949,119 @@ func TestDownloader_PauseAllAndContinueAll(t *testing.T) {
 
 	// Clean up
 	downloader.Delete(nil, true)
+}
+
+// storelessFetcherManager leaves the http fetcher's connection state out of the
+// tests below, since the fetcher hands it to Store while its own goroutines still write it.
+type storelessFetcherManager struct {
+	fetcher.FetcherManager
+}
+
+func (fm *storelessFetcherManager) Store(fetcher.Fetcher) (any, error) {
+	return nil, nil
+}
+
+func newStorelessDownloader(refreshInterval int) *Downloader {
+	return NewDownloader(&DownloaderConfig{
+		FetchManagers:   []fetcher.FetcherManager{&storelessFetcherManager{new(ihttp.FetcherManager)}},
+		RefreshInterval: refreshInterval,
+	})
+}
+
+func startTestDataServer(delay time.Duration) *httptest.Server {
+	data := make([]byte, 1024*1024)
+	return httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		time.Sleep(delay)
+		gohttp.ServeContent(w, r, "test.data", time.Time{}, bytes.NewReader(data))
+	}))
+}
+
+func TestDownloader_CreateWhileProgressRefreshes(t *testing.T) {
+	server := startTestDataServer(0)
+	defer server.Close()
+
+	taskCount := 8
+	events := make(chan EventKey, taskCount*2)
+	downloader := newStorelessDownloader(1)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyDone || event.Key == EventKeyError {
+			events <- event.Key
+		}
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Close()
+
+	dir := t.TempDir()
+	for i := 0; i < taskCount; i++ {
+		_, err := downloader.CreateDirect(&base.Request{URL: server.URL + "/test.data"}, &base.Options{
+			Path: dir,
+			Name: fmt.Sprintf("%d.data", i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	timeout := time.After(time.Minute)
+	for done := 0; done < taskCount; {
+		select {
+		case key := <-events:
+			if key == EventKeyError {
+				t.Fatal("task failed")
+			}
+			done++
+		case <-timeout:
+			t.Fatalf("%d of %d tasks done", done, taskCount)
+		}
+	}
+}
+
+func TestDownloader_PauseWhileStarting(t *testing.T) {
+	server := startTestDataServer(time.Second)
+	defer server.Close()
+
+	events := make(chan EventKey, 16)
+	downloader := newStorelessDownloader(0)
+	downloader.Listener(func(event *Event) {
+		if event.Key == EventKeyStart || event.Key == EventKeyPause || event.Key == EventKeyError {
+			events <- event.Key
+		}
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Close()
+
+	id, err := downloader.CreateDirect(&base.Request{URL: server.URL + "/test.data"}, &base.Options{
+		Path: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := downloader.Pause(&TaskFilter{IDs: []string{id}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The start and the pause handler take turns on the task, in either order.
+	seen := map[EventKey]bool{}
+	timeout := time.After(time.Minute)
+	for !seen[EventKeyStart] || !seen[EventKeyPause] {
+		select {
+		case key := <-events:
+			if key == EventKeyError {
+				t.Fatal("task failed")
+			}
+			seen[key] = true
+		case <-timeout:
+			t.Fatalf("got only %v", seen)
+		}
+	}
+
+	if err := downloader.Delete(&TaskFilter{IDs: []string{id}}, true); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestDownloader_GetTask(t *testing.T) {
