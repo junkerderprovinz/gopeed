@@ -6,6 +6,7 @@ This branch is the gopeed that [KnightLoader](https://github.com/junkerderprovin
 - Settings to turn off DHT and PEX.
 - `ConfigurableFetcherManager.ApplyConfig`, so a protocol can pick up config changes without waiting for the next task.
 - A fix for a panic when the BitTorrent client is closed right after it was built.
+- Locking for the task list and for task status and progress, which the downloader's own goroutines read while other calls change them.
 
 KnightLoader pins the branch with a `replace` directive in its `go.mod` that points at a commit here. Because this is the fork's default branch, Renovate in KnightLoader proposes the new head whenever the branch moves.
 
