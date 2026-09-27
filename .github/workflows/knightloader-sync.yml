@@ -1,0 +1,167 @@
+name: Follow gopeed releases
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: knightloader-sync
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UPSTREAM: https://github.com/GopeedLab/gopeed.git
+  SELF: .github/workflows/knightloader-sync.yml
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # Public repositories switch off scheduled workflows after 60 days
+      # without activity, and gopeed can go longer than that between releases.
+      - name: Keep the schedule enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/knightloader-sync.yml/enable"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: knightloader
+          fetch-depth: 0
+
+      - name: Find the newest gopeed release
+        id: tags
+        run: |
+          git fetch --no-tags "$UPSTREAM" '+refs/tags/*:refs/tags/*'
+          stable='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          latest=$(git tag -l | grep -E "$stable" | sort -V | tail -n1)
+          base=$(git tag -l --merged HEAD | grep -E "$stable" | sort -V | tail -n1)
+          if [ -z "$latest" ] || [ -z "$base" ]; then
+            echo "::error::no release tag found (latest=$latest, base=$base)"
+            exit 1
+          fi
+          {
+            echo "latest=$latest"
+            echo "base=$base"
+            echo "head=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$latest" = "$base" ]; then
+            echo "::notice::knightloader is already based on $latest"
+          fi
+
+      - name: Rebase onto the new release
+        id: rebase
+        if: steps.tags.outputs.latest != steps.tags.outputs.base
+        env:
+          LATEST: ${{ steps.tags.outputs.latest }}
+          BASE: ${{ steps.tags.outputs.base }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          log="$RUNNER_TEMP/rebase.log"
+
+          # This branch drops upstream's workflows: GITHUB_TOKEN may not push
+          # a change to .github/workflows, so an upstream edit to one of them
+          # is resolved by keeping it deleted.
+          if ! git rebase --onto "$LATEST" "$BASE" >"$log" 2>&1; then
+            while true; do
+              conflicts=$(git diff --name-only --diff-filter=U)
+              other=$(grep -v '^\.github/workflows/' <<<"$conflicts" || true)
+              if [ -z "$conflicts" ] || [ -n "$other" ] || grep -qx "$SELF" <<<"$conflicts"; then
+                { echo; git status --short; } >>"$log"
+                git rebase --abort
+                cat "$log"
+                exit 1
+              fi
+              xargs -d '\n' git rm -q -- <<<"$conflicts"
+              if GIT_EDITOR=true git rebase --continue >>"$log" 2>&1; then
+                break
+              fi
+            done
+          fi
+
+          stray=$(git ls-files .github/workflows | grep -vx "$SELF" || true)
+          if [ -n "$stray" ]; then
+            xargs -d '\n' git rm -q -- <<<"$stray"
+            git commit -qm "Drop upstream workflows"
+          fi
+          cat "$log"
+          git log --oneline "$LATEST..HEAD"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.rebase.outcome == 'success'
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        id: vet
+        if: steps.rebase.outcome == 'success'
+        run: go vet ./... 2>&1 | tee "$RUNNER_TEMP/vet.log"
+
+      - name: Test
+        id: test
+        if: steps.vet.outcome == 'success'
+        run: |
+          {
+            go test -race ./internal/protocol/bt/...
+            go test ./pkg/download/...
+          } 2>&1 | tee "$RUNNER_TEMP/test.log"
+
+      - name: Push knightloader
+        id: push
+        if: steps.test.outcome == 'success'
+        env:
+          OLD_HEAD: ${{ steps.tags.outputs.head }}
+        run: |
+          git push --force-with-lease="knightloader:$OLD_HEAD" origin HEAD:knightloader 2>&1 | tee "$RUNNER_TEMP/push.log"
+
+      - name: Report the failure in an issue
+        if: failure() && steps.tags.outputs.latest != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.tags.outputs.latest }}
+          BASE: ${{ steps.tags.outputs.base }}
+          REBASE: ${{ steps.rebase.outcome }}
+          VET: ${{ steps.vet.outcome }}
+          TEST: ${{ steps.test.outcome }}
+          PUSH: ${{ steps.push.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$REBASE" = failure ]; then
+            what="The rebase from $BASE onto $LATEST stopped on a conflict."; log=rebase.log
+          elif [ "$VET" = failure ]; then
+            what="go vet failed after rebasing onto $LATEST."; log=vet.log
+          elif [ "$TEST" = failure ]; then
+            what="The tests failed after rebasing onto $LATEST."; log=test.log
+          elif [ "$PUSH" = failure ]; then
+            what="The rebase onto $LATEST passed, but the push was refused."; log=push.log
+          else
+            exit 0
+          fi
+          body="$RUNNER_TEMP/issue.md"
+          {
+            echo "$what knightloader was left unchanged."
+            echo
+            echo "Run: $RUN_URL"
+            echo
+            echo '```'
+            tail -n 80 "$RUNNER_TEMP/$log" 2>/dev/null || echo "no log"
+            echo '```'
+          } >"$body"
+
+          title="Sync to gopeed $LATEST failed"
+          number=$(gh issue list --state open --limit 100 --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body-file "$body"
+          else
+            gh issue create --title "$title" --body-file "$body"
+          fi
