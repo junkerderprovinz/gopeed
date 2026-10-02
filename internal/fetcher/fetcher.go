@@ -1,6 +1,8 @@
 package fetcher
 
 import (
+	"context"
+	"io"
 	"path"
 	"strings"
 
@@ -35,6 +37,21 @@ type Uploader interface {
 	Upload() error
 	UploadedBytes() int64
 	WaitUpload() error
+}
+
+// Streamer is implemented by a fetcher that can hand out a file of its task
+// before the download has finished.
+type Streamer interface {
+	Stream(file int) (StreamReader, error)
+}
+
+// StreamReader reads one file of a task that may still be downloading. A read
+// waits for bytes that have not arrived, and while the reader is open the
+// fetcher fetches what it reads, and what lies just ahead, before the rest.
+type StreamReader interface {
+	io.ReadSeekCloser
+	// ReadContext is Read that gives up when ctx ends before the bytes arrive.
+	ReadContext(ctx context.Context, p []byte) (int, error)
 }
 
 // FetcherMeta defines the meta information of a fetcher.

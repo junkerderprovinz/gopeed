@@ -51,6 +51,8 @@ type Fetcher struct {
 	torrentDropCtx  context.Context
 	torrentDropFunc func()
 	uploadDoneCh    chan any
+
+	streams streams
 }
 
 func (f *Fetcher) Setup(ctl *controller.Controller) {

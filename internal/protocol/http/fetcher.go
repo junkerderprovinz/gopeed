@@ -108,6 +108,12 @@ type connection struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// running is set while a goroutine works on this connection, and parked
+	// when a reader took it away from its range (see stream.go), which leaves
+	// the rest of the range to whichever connection is free first.
+	running bool
+	parked  bool
 }
 
 // ============================================================================
@@ -268,6 +274,9 @@ type Fetcher struct {
 	// Resolve connection control
 	resolveCtx    context.Context
 	resolveCancel context.CancelFunc
+
+	// readers is where each open stream reader reads, guarded by connMu.
+	readers map[*streamReader]int64
 }
 
 func (f *Fetcher) Setup(ctl *controller.Controller) {
@@ -805,10 +814,11 @@ func (f *Fetcher) expandConnections() {
 
 		// First connection starts from prefetched position
 		conn := &connection{
-			ID:    0,
-			Role:  rolePrimary,
-			State: connNotStarted,
-			Chunk: newChunk(prefetched, totalSize-1),
+			ID:      0,
+			Role:    rolePrimary,
+			State:   connNotStarted,
+			Chunk:   newChunk(prefetched, totalSize-1),
+			running: true,
 		}
 		// Mark prefetched bytes as already downloaded
 		conn.Chunk.Downloaded = 0    // Start fresh from prefetched position
@@ -859,10 +869,11 @@ func (f *Fetcher) expandConnections() {
 
 		connID := len(f.connections)
 		conn := &connection{
-			ID:    connID,
-			Role:  roleWorker,
-			State: connNotStarted,
-			Chunk: newChunk,
+			ID:      connID,
+			Role:    roleWorker,
+			State:   connNotStarted,
+			Chunk:   newChunk,
+			running: true,
 		}
 		conn.ctx, conn.cancel = context.WithCancel(f.ctx)
 
@@ -891,6 +902,11 @@ func (f *Fetcher) expandConnections() {
 
 func (f *Fetcher) runConnection(conn *connection) {
 	defer f.wg.Done()
+	defer func() {
+		f.connMu.Lock()
+		conn.running = false
+		f.connMu.Unlock()
+	}()
 
 	f.connMu.Lock()
 	conn.State = connConnecting
@@ -911,7 +927,9 @@ func (f *Fetcher) runConnection(conn *connection) {
 
 		err := f.downloadChunkOnce(conn, client, buf)
 		if err == nil {
-			if !f.meta.Res.Range || !f.helpOtherConnection(conn) {
+			// A connection a reader took away must not pick up other work on
+			// its way out.
+			if !f.meta.Res.Range || conn.ctx.Err() != nil || !f.helpOtherConnection(conn) {
 				f.connMu.Lock()
 				conn.Completed = true
 				conn.State = connCompleted
@@ -925,7 +943,7 @@ func (f *Fetcher) runConnection(conn *connection) {
 			continue
 		}
 
-		if errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) || conn.ctx.Err() != nil {
 			return
 		}
 
@@ -1192,8 +1210,10 @@ func (f *Fetcher) runConnectionWithResolveResp(conn *connection) {
 			}
 			f.fileMu.Unlock()
 
+			f.connMu.Lock()
 			conn.Chunk.Downloaded += int64(n)
 			conn.Downloaded += int64(n)
+			f.connMu.Unlock()
 		}
 		if err != nil {
 			if err == io.EOF {
@@ -1287,8 +1307,10 @@ func (f *Fetcher) runConnectionFallback(conn *connection) {
 					}
 					f.fileMu.Unlock()
 
+					f.connMu.Lock()
 					conn.Chunk.Downloaded += int64(n)
 					conn.Downloaded += int64(n)
+					f.connMu.Unlock()
 				}
 				if err != nil {
 					if err == io.EOF {
@@ -1372,6 +1394,10 @@ func (f *Fetcher) runConnectionFallback(conn *connection) {
 func (f *Fetcher) helpOtherConnection(helper *connection) bool {
 	f.connMu.Lock()
 	defer f.connMu.Unlock()
+
+	if f.adoptParkedLocked(helper) {
+		return true
+	}
 
 	// Find the connection with longest remaining time
 	var slowestConn *connection
@@ -1458,11 +1484,19 @@ func (f *Fetcher) resumeConnections() {
 				continue
 			}
 		}
+		// Readers can leave more unfinished ranges than there are
+		// connections; the rest wait for a connection to be free.
+		if f.meta.Res.Range && len(toResume) >= f.maxConnections() {
+			conn.parked = true
+			continue
+		}
 		f.resetConnectionForRestart(conn)
 		// Reset the connection state for resume
 		conn.ctx, conn.cancel = context.WithCancel(f.ctx)
 		conn.State = connNotStarted
 		conn.failed = false // Clear failed flag for resumed connection
+		conn.parked = false
+		conn.running = true
 		toResume = append(toResume, conn)
 	}
 	f.connMu.Unlock()
@@ -1475,11 +1509,17 @@ func (f *Fetcher) resumeConnections() {
 }
 
 func (f *Fetcher) waitForCompletion() {
-	f.wg.Wait()
-	// Only trigger completion if not cancelled/paused
-	if f.ctx != nil && f.ctx.Err() == nil {
-		f.onDownloadComplete()
+	for {
+		f.wg.Wait()
+		// Only trigger completion if not cancelled/paused
+		if f.ctx == nil || f.ctx.Err() != nil {
+			return
+		}
+		if !f.restartParked() {
+			break
+		}
 	}
+	f.onDownloadComplete()
 }
 
 func (f *Fetcher) onDownloadComplete() {
