@@ -7,12 +7,13 @@ This branch is the gopeed that [KnightLoader](https://github.com/junkerderprovin
 - `ConfigurableFetcherManager.ApplyConfig`, so a protocol can pick up config changes without waiting for the next task.
 - A fix for a panic when the BitTorrent client is closed right after it was built.
 - Locking for the task list and for task status and progress, which the downloader's own goroutines read while other calls change them.
+- Binding BitTorrent traffic to one network interface (`pkg/netbind`): peers, trackers and the DHT use only that interface, and nothing is sent or received while it is missing or down.
 
 KnightLoader pins the branch with a `replace` directive in its `go.mod` that points at a commit here. Because this is the fork's default branch, Renovate in KnightLoader proposes the new head whenever the branch moves.
 
 ## Staying on the latest release
 
-`.github/workflows/knightloader-sync.yml` runs every Monday and can also be started by hand. It looks up the newest gopeed release tag (`vX.Y.Z`; pre-releases are skipped). If the branch is still based on an older release, the job rebases the commits above that release onto the new tag and runs `go vet ./...` plus the tests in `internal/protocol/bt` (with `-race`) and `pkg/download`. It force-pushes the branch only when all of them pass.
+`.github/workflows/knightloader-sync.yml` runs every Monday and can also be started by hand. It looks up the newest gopeed release tag (`vX.Y.Z`; pre-releases are skipped). If the branch is still based on an older release, the job rebases the commits above that release onto the new tag and runs `go vet ./...` plus the tests in `internal/protocol/bt` and `pkg/netbind` (with `-race`) and `pkg/download`. It force-pushes the branch only when all of them pass.
 
 When the rebase hits a conflict or a check fails, nothing is pushed. The workflow opens an issue named after the tag instead, or comments on it if one is already open. To fix it by hand, rebase onto the tag locally, resolve the conflict, run the same tests and push with `--force-with-lease`.
 

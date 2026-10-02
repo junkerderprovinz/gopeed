@@ -1,8 +1,11 @@
 package bt
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"net"
 	gohttp "net/http"
 	"net/url"
 	"os"
@@ -14,6 +17,7 @@ import (
 	"github.com/GopeedLab/gopeed/internal/fetcher"
 	"github.com/GopeedLab/gopeed/internal/test"
 	"github.com/GopeedLab/gopeed/pkg/base"
+	"github.com/GopeedLab/gopeed/pkg/netbind"
 	"github.com/GopeedLab/gopeed/pkg/protocol/bt"
 	"golang.org/x/time/rate"
 )
@@ -471,6 +475,51 @@ func TestFetcherManager_ApplyConfig_Rebuild(t *testing.T) {
 	fm.ApplyConfig(mockConfig(config{}))
 	if client != nil {
 		t.Error("ApplyConfig() kept an idle client after DHT and PEX changed")
+	}
+}
+
+func TestFetcherManager_ApplyConfig_Interface(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	fm := new(FetcherManager)
+	f := buildFetcher()
+	if err := f.Resolve(&base.Request{URL: "./testdata/test.torrent"}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	fm.ApplyConfig(mockConfig(config{Interface: "gopeed-missing0"}))
+	if client == nil {
+		t.Fatal("ApplyConfig() closed a client with active torrents")
+	}
+	if st := binder.State(); st.Interface != "gopeed-missing0" || st.Up {
+		t.Fatalf("binder state = %+v, want the missing interface, down", st)
+	}
+	if _, err := cfg.TrackerDialContext(context.Background(), "tcp", "127.0.0.1:1"); !errors.Is(err, netbind.ErrDown) {
+		t.Errorf("tracker dial with the interface missing: %v, want netbind.ErrDown", err)
+	}
+	if _, err := cfg.TrackerListenPacket("udp4", ":0"); !errors.Is(err, netbind.ErrDown) {
+		t.Errorf("tracker socket with the interface missing: %v, want netbind.ErrDown", err)
+	}
+	sockets := 0
+	for _, d := range client.Listeners() {
+		if pc, ok := d.(net.PacketConn); ok {
+			sockets++
+			if _, err := pc.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); err == nil {
+				t.Errorf("the %s socket sent with the interface missing", d.Addr().Network())
+			}
+		}
+	}
+	if sockets == 0 {
+		t.Error("the client has no UDP socket to check")
+	}
+
+	fm.ApplyConfig(mockConfig(config{}))
+	if st := binder.State(); st.Interface != "" || !st.Up {
+		t.Fatalf("binder state = %+v, want any interface, up", st)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

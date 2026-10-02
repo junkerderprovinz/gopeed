@@ -1,11 +1,9 @@
 module github.com/GopeedLab/gopeed
 
-go 1.24.9
-
-toolchain go1.24.11
+go 1.25.0
 
 require (
-	github.com/anacrolix/torrent v1.60.1-0.20251217073903-486bcbe758e0
+	github.com/anacrolix/torrent v1.61.1-0.20260823090931-70072f1a7460
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/bodgit/sevenzip v1.6.1
 	github.com/dop251/goja v0.0.0-20260106131823-651366fbe6e3
@@ -26,9 +24,10 @@ require (
 )
 
 require (
+	github.com/RoaringBitmap/roaring/v2 v2.16.0 // indirect
 	github.com/STARRY-S/zip v0.2.3 // indirect
 	github.com/anacrolix/btree v0.1.1 // indirect
-	github.com/anacrolix/missinggo/v2 v2.10.0 // indirect
+	github.com/anacrolix/missinggo/v2 v2.11.0 // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/bodgit/plumbing v1.3.0 // indirect
 	github.com/bodgit/windows v1.0.1 // indirect
@@ -70,11 +69,11 @@ require (
 	github.com/RoaringBitmap/roaring v1.9.4 // indirect
 	github.com/acomagu/bufpipe v1.0.4 // indirect
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
-	github.com/anacrolix/chansync v0.7.0 // indirect
-	github.com/anacrolix/dht/v2 v2.23.0 // indirect
+	github.com/anacrolix/chansync v0.8.0 // indirect
+	github.com/anacrolix/dht/v2 v2.23.1-0.20260525063928-ec3a9bd99456 // indirect
 	github.com/anacrolix/envpprof v1.5.0 // indirect
 	github.com/anacrolix/generics v0.2.0 // indirect
-	github.com/anacrolix/go-libutp v1.3.2 // indirect
+	github.com/anacrolix/go-libutp v1.5.0 // indirect
 	github.com/anacrolix/log v0.17.1-0.20251118025802-918f1157b7bb // indirect
 	github.com/anacrolix/missinggo v1.3.0 // indirect
 	github.com/anacrolix/missinggo/perf v1.0.0 // indirect

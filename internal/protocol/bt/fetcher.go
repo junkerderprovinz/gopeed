@@ -5,9 +5,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +19,7 @@ import (
 	"github.com/GopeedLab/gopeed/internal/controller"
 	"github.com/GopeedLab/gopeed/internal/fetcher"
 	"github.com/GopeedLab/gopeed/pkg/base"
+	"github.com/GopeedLab/gopeed/pkg/netbind"
 	"github.com/GopeedLab/gopeed/pkg/protocol/bt"
 	"github.com/GopeedLab/gopeed/pkg/util"
 	"github.com/anacrolix/torrent"
@@ -77,17 +81,72 @@ func (f *Fetcher) initClient() (err error) {
 	cfg.Seed = true
 	cfg.Bep20 = fmt.Sprintf("-GP%s-", parseBep20())
 	cfg.ExtendedHandshakeClientVersion = fmt.Sprintf("Gopeed %s", base.Version)
-	cfg.ListenPort = f.config.ListenPort
 	cfg.NoDHT = f.config.DisableDHT
 	cfg.DisablePEX = f.config.DisablePEX
 	cfg.UploadRateLimiter = uploadLimiter
-	cfg.HTTPProxy = f.ctl.GetProxy(f.meta.Req.Proxy)
-	dnsResolver := &DnsCacheResolver{RefreshTimeout: 5 * time.Minute}
-	cfg.TrackerDialContext = dnsResolver.DialContext
-	client, err = torrent.NewClient(cfg)
-	if err != nil {
-		return
+
+	// Every socket comes from the binder, so binding to an interface or
+	// leaving it applies to running torrents too. UPnP talks to the router
+	// of the local network and WebRTC opens sockets of its own, so both stay
+	// off on a client built bound.
+	binder.SetInterface(f.config.Interface)
+	bound := f.config.Interface != ""
+	cfg.NoDefaultPortForwarding = bound
+	cfg.DisableWebtorrent = bound
+	proxy := f.ctl.GetProxy(f.meta.Req.Proxy)
+	cfg.HTTPProxy = func(r *http.Request) (*url.URL, error) {
+		// A proxy would dial the tracker itself, past the interface.
+		if proxy == nil || binder.State().Interface != "" {
+			return nil, nil
+		}
+		return proxy(r)
 	}
+	dnsResolver := &DnsCacheResolver{RefreshTimeout: 5 * time.Minute, Dial: binder.DialContext}
+	cfg.TrackerDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if !binder.State().Up {
+			return nil, netbind.ErrDown
+		}
+		return dnsResolver.DialContext(ctx, network, addr)
+	}
+	cfg.TrackerListenPacket = binder.ListenPacket
+	cfg.HTTPDialContext = binder.DialContext
+	cfg.ListenPacket = func(network, addr string) (net.PacketConn, error) {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		p, err := strconv.Atoi(port)
+		if err != nil {
+			return nil, err
+		}
+		return binder.PacketConn(network, p)
+	}
+	// The client's own TCP sockets cannot move to another address, so it
+	// gets the binder's instead.
+	cfg.DisableTCP = true
+	// A free port can be taken before it is listened on, so a picked port
+	// is tried more than once, as the client does with its own.
+	for try := 0; ; try++ {
+		if peerListeners, cfg.ListenPort, err = listenPeers(f.config.ListenPort); err == nil {
+			if client, err = torrent.NewClient(cfg); err == nil {
+				break
+			}
+			closePeerListeners()
+		}
+		if f.config.ListenPort != 0 || try == 4 {
+			return
+		}
+	}
+	for _, l := range peerListeners {
+		client.AddListener(l)
+		client.AddDialer(torrent.NetworkDialer{
+			Network: l.network,
+			// The peer protocol keeps its own connections alive.
+			Dialer: netbind.Dialer{Binder: binder, KeepAlive: -1, NoLinger: true},
+		})
+	}
+
+	liveClient.Store(client)
 
 	closeCtx, closeFunc = context.WithCancel(context.Background())
 	// Pass closeCtx by value, closeClient may reset it before the goroutine runs.
@@ -538,7 +597,11 @@ func doCloseClient() error {
 		closeFunc()
 	}
 	if client != nil {
+		liveClient.Store(nil)
 		errs := client.Close()
+		// The client leaves listeners it was handed to their owner.
+		closePeerListeners()
+		binder.SetInterface("")
 		if len(errs) > 0 {
 			return errs[0]
 		}
@@ -627,8 +690,9 @@ func (fm *FetcherManager) Close() error {
 	return closeClient()
 }
 
-// ApplyConfig sets the upload limit on running torrents. Port, DHT and PEX are fixed
-// when the client is built, so an idle client is closed and rebuilt by the next task.
+// ApplyConfig sets the upload limit and the network interface on running torrents.
+// Port, DHT and PEX are fixed when the client is built, and so are UPnP and WebRTC,
+// which follow the interface; an idle client is closed and rebuilt by the next task.
 func (fm *FetcherManager) ApplyConfig(getConfig func(v any)) {
 	var c config
 	getConfig(&c)
@@ -641,10 +705,17 @@ func (fm *FetcherManager) ApplyConfig(getConfig func(v any)) {
 
 	lock.Lock()
 	defer lock.Unlock()
-	if client == nil || len(client.Torrents()) > 0 {
+	// Not before a client exists: one built later binds as it starts, and an
+	// earlier binder would watch the interface for nothing.
+	if client == nil {
 		return
 	}
-	if cfg.ListenPort != c.ListenPort || cfg.NoDHT != c.DisableDHT || cfg.DisablePEX != c.DisablePEX {
+	binder.SetInterface(c.Interface)
+	if len(client.Torrents()) > 0 {
+		return
+	}
+	if (c.ListenPort != 0 && cfg.ListenPort != c.ListenPort) || cfg.NoDHT != c.DisableDHT || cfg.DisablePEX != c.DisablePEX ||
+		cfg.DisableWebtorrent != (c.Interface != "") {
 		doCloseClient()
 	}
 }
