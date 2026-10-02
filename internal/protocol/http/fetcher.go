@@ -101,6 +101,10 @@ type connection struct {
 	retryTimes int
 	lastErr    error
 
+	// source is the URL the connection asks: 0 is the request's own, i its
+	// mirror i-1.
+	source int
+
 	// Speed tracking for work stealing decisions
 	speed             int64 // bytes per second
 	lastSpeedCheck    int64 // timestamp in nanoseconds
@@ -222,6 +226,9 @@ type Fetcher struct {
 	connMu      sync.Mutex
 	connections []*connection
 	resolveConn *connection // The special resolve connection
+	// deadSources are the sources that kept failing; no connection asks them
+	// again. Guarded by connMu.
+	deadSources map[int]bool
 
 	// Slow start controller
 	slowStart *slowStartController
@@ -859,10 +866,11 @@ func (f *Fetcher) expandConnections() {
 
 		connID := len(f.connections)
 		conn := &connection{
-			ID:    connID,
-			Role:  roleWorker,
-			State: connNotStarted,
-			Chunk: newChunk,
+			ID:     connID,
+			Role:   roleWorker,
+			State:  connNotStarted,
+			Chunk:  newChunk,
+			source: f.liveSourceLocked(connID % f.sourceCount()),
 		}
 		conn.ctx, conn.cancel = context.WithCancel(f.ctx)
 
@@ -902,6 +910,9 @@ func (f *Fetcher) runConnection(conn *connection) {
 
 	retries := 0
 	conn.retryTimes = 0
+	// stuck counts the failures in a row that brought no bytes, which is
+	// what decides when a source with mirrors beside it is given up.
+	stuck := 0
 
 	for {
 		// Rebuild client with updated fast-fail timeout on retries
@@ -909,7 +920,11 @@ func (f *Fetcher) runConnection(conn *connection) {
 			client = f.buildFastFailClient()
 		}
 
+		before := conn.Downloaded
 		err := f.downloadChunkOnce(conn, client, buf)
+		if conn.Downloaded > before {
+			stuck = 0
+		}
 		if err == nil {
 			if !f.meta.Res.Range || !f.helpOtherConnection(conn) {
 				f.connMu.Lock()
@@ -935,8 +950,15 @@ func (f *Fetcher) runConnection(conn *connection) {
 			conn.lastErr = err
 		}
 
+		stuck++
 		if shouldCountHTTPFailure(err) {
 			if re := extractRequestError(err); re != nil && re.Code == 403 {
+				// A 403 is often a cap on connections rather than the end of
+				// the source, so the source stays in use for the others.
+				if f.switchSource(conn, false) {
+					retries, stuck = 0, 0
+					continue
+				}
 				f.connMu.Lock()
 				conn.State = connFailed
 				conn.failed = true
@@ -954,11 +976,18 @@ func (f *Fetcher) runConnection(conn *connection) {
 				f.slowStart.onConnectFailed()
 			}
 			if conn.retryTimes >= 3 {
+				if f.switchSource(conn, true) {
+					retries, stuck = 0, 0
+					continue
+				}
 				f.connMu.Lock()
 				conn.State = connFailed
 				f.connMu.Unlock()
 				return
 			}
+		} else if stuck >= 3 && f.switchSource(conn, true) {
+			retries, stuck = 0, 0
+			continue
 		}
 
 		f.connMu.Lock()
@@ -971,6 +1000,65 @@ func (f *Fetcher) runConnection(conn *connection) {
 		retries++
 		time.Sleep(retryDelay)
 	}
+}
+
+// sourceCount is the number of URLs the file can be fetched from: the
+// request's own and its mirrors.
+func (f *Fetcher) sourceCount() int {
+	if extra, ok := f.meta.Req.Extra.(*fhttp.ReqExtra); ok {
+		return 1 + len(extra.Mirrors)
+	}
+	return 1
+}
+
+// liveSourceLocked is want, or the first source after it that has not been
+// given up. switchSource keeps one source alive, so there always is one.
+// Caller holds connMu.
+func (f *Fetcher) liveSourceLocked(want int) int {
+	n := f.sourceCount()
+	for i := range n {
+		if s := (want + i) % n; !f.deadSources[s] {
+			return s
+		}
+	}
+	return want
+}
+
+// switchSource moves conn to the next source still in use, and with drop
+// gives up the one it leaves. It reports false when there is no other
+// source, and then changes nothing.
+func (f *Fetcher) switchSource(conn *connection, drop bool) bool {
+	n := f.sourceCount()
+	f.connMu.Lock()
+	defer f.connMu.Unlock()
+	for i := 1; i < n; i++ {
+		s := (conn.source + i) % n
+		if f.deadSources[s] {
+			continue
+		}
+		if drop {
+			if f.deadSources == nil {
+				f.deadSources = map[int]bool{}
+			}
+			f.deadSources[conn.source] = true
+		}
+		conn.source = s
+		conn.retryTimes = 0
+		conn.failed = false
+		return true
+	}
+	return false
+}
+
+// sourceRequest builds the request to source s. Only the request's own URL
+// goes through the redirect it resolved to.
+func (f *Fetcher) sourceRequest(ctx context.Context, s int) (*http.Request, error) {
+	if s == 0 {
+		return f.buildRequest(ctx, f.meta.Req)
+	}
+	req := *f.meta.Req
+	req.URL = f.meta.Req.Extra.(*fhttp.ReqExtra).Mirrors[s-1]
+	return f.buildRequestWithURL(ctx, &req, false)
 }
 
 // downloadChunkOnce performs a single HTTP request for the current chunk without retrying.
@@ -990,9 +1078,12 @@ func (f *Fetcher) downloadChunkOnce(conn *connection, client *http.Client, buf [
 	}
 	rangeStart := conn.Chunk.Begin + conn.Chunk.Downloaded
 	rangeEnd := conn.Chunk.End
+	// Another connection may have given up this one's source.
+	conn.source = f.liveSourceLocked(conn.source)
+	source := conn.source
 	f.connMu.Unlock()
 
-	httpReq, err := f.buildRequest(conn.ctx, f.meta.Req)
+	httpReq, err := f.sourceRequest(conn.ctx, source)
 	if err != nil {
 		return err
 	}
@@ -1010,13 +1101,20 @@ func (f *Fetcher) downloadChunkOnce(conn *connection, client *http.Client, buf [
 		return err
 	}
 
+	// A mirror answering a range with the whole file would write its start
+	// at the chunk's offset.
+	if source > 0 && f.meta.Res.Range && resp.StatusCode == base.HttpCodeOK {
+		resp.Body.Close()
+		return NewRequestError(resp.StatusCode)
+	}
+
 	if resp.StatusCode != base.HttpCodeOK && resp.StatusCode != base.HttpCodePartialContent {
 		resp.Body.Close()
 		originalErr := NewRequestError(resp.StatusCode)
 
 		// Check if this might be a redirect URL expiration error
 		// If so, try falling back to the original URL
-		if f.hasRedirectURL() && isRedirectExpiredError(originalErr) {
+		if source == 0 && f.hasRedirectURL() && isRedirectExpiredError(originalErr) {
 			fallbackResp, fallbackErr := f.tryFallbackToOriginalURL(conn.ctx, client, rangeStart, rangeEnd)
 			if fallbackErr == nil && fallbackResp != nil {
 				// Fallback succeeded, use this response instead
