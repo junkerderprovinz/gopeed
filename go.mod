@@ -162,3 +162,6 @@ require (
 	modernc.org/sqlite v1.43.0 // indirect
 	zombiezen.com/go/sqlite v1.4.2 // indirect
 )
+
+// Two fixes to anacrolix/torrent that upstream does not have yet, see KNIGHTLOADER.md.
+replace github.com/anacrolix/torrent => github.com/junkerderprovinz/torrent v1.61.1-0.20261003081852-a1f590161223

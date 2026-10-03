@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	gohttp "net/http"
 	"net/netip"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/GopeedLab/gopeed/internal/controller"
 	"github.com/GopeedLab/gopeed/internal/fetcher"
@@ -598,4 +600,41 @@ func TestATorrentTheLibraryPanicsOnFailsInsteadOfCrashing(t *testing.T) {
 	if err == nil {
 		t.Fatal("Resolve of a zero info hash succeeded, want an error")
 	}
+}
+
+func TestClosingTheClientFreesTheTrackerSockets(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeClient() })
+	tracker, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	f := buildFetcher()
+	err = f.Resolve(&base.Request{
+		URL:   "./testdata/test.torrent",
+		Extra: bt.ReqExtra{Trackers: []string{"udp://" + tracker.LocalAddr().String() + "/announce"}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracker.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, from, err := tracker.ReadFrom(make([]byte, 2048))
+	if err != nil {
+		t.Fatalf("no packet from the tracker socket: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	port := from.(*net.UDPAddr).Port
+	pc, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("port %d of the tracker socket is still taken after the client closed: %v", port, err)
+	}
+	pc.Close()
 }
