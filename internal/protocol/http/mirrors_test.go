@@ -145,10 +145,10 @@ func TestFetcher_MirrorSendingTheWholeFileIsRefused(t *testing.T) {
 	}
 }
 
-// slowWriter paces a response, so the requests a source answers overlap.
-type slowWriter struct{ gohttp.ResponseWriter }
+// pacedWriter paces a response, so the requests a source answers overlap.
+type pacedWriter struct{ gohttp.ResponseWriter }
 
-func (w slowWriter) Write(p []byte) (int, error) {
+func (w pacedWriter) Write(p []byte) (int, error) {
 	time.Sleep(time.Millisecond)
 	return w.ResponseWriter.Write(p)
 }
@@ -166,7 +166,7 @@ func TestFetcher_DeadMirrorsLeaveTheURLItsShareOfConnections(t *testing.T) {
 			for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
 			}
 		}
-		gohttp.ServeContent(slowWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
+		gohttp.ServeContent(pacedWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
 	})
 	gone := gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
 		refused.Store(true)
@@ -199,7 +199,7 @@ func TestFetcher_URLRefusingRangesLeavesTheDownloadToAllMirrors(t *testing.T) {
 			w.WriteHeader(gohttp.StatusGone)
 			return
 		}
-		gohttp.ServeContent(slowWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
+		gohttp.ServeContent(pacedWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
 	})
 	sa := httptest.NewServer(primary)
 	defer sa.Close()
@@ -208,7 +208,7 @@ func TestFetcher_URLRefusingRangesLeavesTheDownloadToAllMirrors(t *testing.T) {
 	for range 2 {
 		c := &source{data: data}
 		s := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
-			c.ServeHTTP(slowWriter{w}, r)
+			c.ServeHTTP(pacedWriter{w}, r)
 		}))
 		defer s.Close()
 		copies = append(copies, c)
@@ -273,7 +273,7 @@ func TestFetcher_URLForbiddingRangesLeavesItsShareToTheMirrors(t *testing.T) {
 			w.WriteHeader(gohttp.StatusForbidden)
 			return
 		}
-		gohttp.ServeContent(slowWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
+		gohttp.ServeContent(pacedWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
 	})
 	sa := httptest.NewServer(primary)
 	defer sa.Close()
@@ -281,7 +281,7 @@ func TestFetcher_URLForbiddingRangesLeavesItsShareToTheMirrors(t *testing.T) {
 	for range 2 {
 		c := &source{data: data}
 		s := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
-			c.ServeHTTP(slowWriter{w}, r)
+			c.ServeHTTP(pacedWriter{w}, r)
 		}))
 		defer s.Close()
 		mirrors = append(mirrors, s.URL+"/mirror.data")
@@ -302,7 +302,7 @@ func TestFetcher_EverySourceForbiddingRangesEndsTheDownload(t *testing.T) {
 			w.WriteHeader(gohttp.StatusForbidden)
 			return
 		}
-		gohttp.ServeContent(slowWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
+		gohttp.ServeContent(pacedWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
 	})
 	var urls []string
 	for range 3 {
