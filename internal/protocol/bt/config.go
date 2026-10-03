@@ -14,4 +14,7 @@ type config struct {
 	// DisableDHT and DisablePEX turn off peer discovery for public torrents, private torrents never use it.
 	DisableDHT bool `json:"disableDht"`
 	DisablePEX bool `json:"disablePex"`
+	// Interface is the network interface all BitTorrent traffic goes through, empty for any.
+	// While it is missing or down, nothing is sent or received.
+	Interface string `json:"interface"`
 }

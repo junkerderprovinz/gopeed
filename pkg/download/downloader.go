@@ -1,6 +1,7 @@
 package download
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -401,6 +402,14 @@ func (d *Downloader) saveTask(task *Task) error {
 }
 
 func (d *Downloader) Resolve(req *base.Request, opts *base.Options) (rr *ResolveResult, err error) {
+	return d.ResolveContext(context.Background(), req, opts)
+}
+
+// ResolveContext is Resolve for a caller that may give up on it. Once ctx
+// ends, a resolve still waiting stops, a result Create has not taken is
+// discarded, and the fetcher lets go of what it holds: for BitTorrent, the
+// torrent, which would otherwise stay in the client.
+func (d *Downloader) ResolveContext(ctx context.Context, req *base.Request, opts *base.Options) (rr *ResolveResult, err error) {
 	rrId, err := gonanoid.New()
 	if err != nil {
 		return
@@ -417,7 +426,7 @@ func (d *Downloader) Resolve(req *base.Request, opts *base.Options) (rr *Resolve
 		return
 	}
 
-	fetcher, err := d.buildFetcher(req.URL)
+	f, err := d.buildFetcher(req.URL)
 	if err != nil {
 		return
 	}
@@ -425,16 +434,29 @@ func (d *Downloader) Resolve(req *base.Request, opts *base.Options) (rr *Resolve
 	if err != nil {
 		return
 	}
-	err = fetcher.Resolve(req, initOpt)
+	if cr, ok := f.(fetcher.ContextResolver); ok {
+		err = cr.ResolveContext(ctx, req, initOpt)
+	} else {
+		err = f.Resolve(req, initOpt)
+	}
 	if err != nil {
 		return
 	}
 	d.fetcherMapLock.Lock()
-	d.fetcherCache[rrId] = fetcher
+	d.fetcherCache[rrId] = f
 	d.fetcherMapLock.Unlock()
+	context.AfterFunc(ctx, func() {
+		d.fetcherMapLock.Lock()
+		_, ok := d.fetcherCache[rrId]
+		delete(d.fetcherCache, rrId)
+		d.fetcherMapLock.Unlock()
+		if ok {
+			f.Close()
+		}
+	})
 	rr = &ResolveResult{
 		ID:  rrId,
-		Res: fetcher.Meta().Res,
+		Res: f.Meta().Res,
 	}
 	return
 }
@@ -497,17 +519,14 @@ func (d *Downloader) CreateDirectBatch(req *base.CreateTaskBatch) (taskId []stri
 }
 
 func (d *Downloader) Create(rrId string) (taskId string, err error) {
-	d.fetcherMapLock.RLock()
+	// Taken out at once, so a ResolveContext that ends meanwhile cannot close it.
+	d.fetcherMapLock.Lock()
 	fetcher, ok := d.fetcherCache[rrId]
-	d.fetcherMapLock.RUnlock()
+	delete(d.fetcherCache, rrId)
+	d.fetcherMapLock.Unlock()
 	if !ok {
 		return "", errors.New("invalid resource id")
 	}
-	defer func() {
-		d.fetcherMapLock.Lock()
-		delete(d.fetcherCache, rrId)
-		d.fetcherMapLock.Unlock()
-	}()
 	return d.doCreate(fetcher, nil)
 }
 

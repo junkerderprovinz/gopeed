@@ -3,6 +3,7 @@ package download
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -2884,5 +2885,51 @@ func TestDownloader_PatchTask_NotFound(t *testing.T) {
 	err := downloader.Patch("non-existent-id", patchReq, nil)
 	if err != ErrTaskNotFound {
 		t.Errorf("Patch() error = %v, want %v", err, ErrTaskNotFound)
+	}
+}
+
+// closeRecorder builds fetchers that close closed when they are closed.
+type closeRecorder struct {
+	fetcher.FetcherManager
+	closed chan struct{}
+}
+
+func (r *closeRecorder) Build() fetcher.Fetcher {
+	return &closeRecording{r.FetcherManager.Build(), r.closed}
+}
+
+type closeRecording struct {
+	fetcher.Fetcher
+	closed chan struct{}
+}
+
+func (f *closeRecording) Close() error {
+	close(f.closed)
+	return f.Fetcher.Close()
+}
+
+func TestDownloader_ResolveContextClosesAResultNotCreatedWhenItEnds(t *testing.T) {
+	recorder := &closeRecorder{FetcherManager: new(bt.FetcherManager), closed: make(chan struct{})}
+	downloader := NewDownloader(&DownloaderConfig{
+		FetchManagers: []fetcher.FetcherManager{recorder},
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rr, err := downloader.ResolveContext(ctx, &base.Request{URL: "../../internal/protocol/bt/testdata/test.torrent"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-recorder.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fetcher of a result nobody created is still open")
+	}
+	if _, err := downloader.Create(rr.ID); err == nil {
+		t.Error("Create() took a result whose context had ended")
 	}
 }
