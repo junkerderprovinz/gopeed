@@ -8,6 +8,7 @@ This branch is the gopeed that [KnightLoader](https://github.com/junkerderprovin
 - A fix for a panic when the BitTorrent client is closed right after it was built.
 - Locking for the task list and for task status and progress, which the downloader's own goroutines read while other calls change them.
 - Mirror URLs for an HTTP download (`ReqExtra.Mirrors`). A ranged download spreads its connections over the URL and its mirrors, and moves a connection to another source when its own refuses it or keeps failing. No source holds more than its even share of the connections, so the connections of a dead source wait rather than crowd onto the others.
+- `Downloader.Stream`, which reads a file of a running task. A read waits for bytes that have not arrived, and the task fetches the part being read first: a torrent through a reader with readahead and both ends of the file raised, an HTTP download by moving one of its connections to the read position.
 
 KnightLoader pins the branch with a `replace` directive in its `go.mod` that points at a commit here. Because this is the fork's default branch, Renovate in KnightLoader proposes the new head whenever the branch moves.
 
