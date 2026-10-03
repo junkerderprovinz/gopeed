@@ -93,33 +93,6 @@ func (b *Binder) DialContext(ctx context.Context, network, address string) (net.
 	return Dialer{Binder: b}.DialContext(ctx, network, address)
 }
 
-// ListenPacket opens a packet socket on the interface the way net.ListenPacket
-// would, with only the port of address used. It fails with ErrDown while the
-// interface is down, and the socket is closed when the interface changes.
-func (b *Binder) ListenPacket(network, address string) (net.PacketConn, error) {
-	port, err := portOf(address)
-	if err != nil {
-		return nil, err
-	}
-	name, l, gen := b.now()
-	var pc net.PacketConn
-	if name == "" {
-		pc, err = net.ListenPacket(network, address)
-	} else if at := l.addr(name, network); at.IsValid() {
-		pc, err = listenPacket(name, l, network, at, port)
-	} else {
-		err = ErrDown
-	}
-	if err != nil {
-		return nil, err
-	}
-	p := &packet{PacketConn: pc, b: b}
-	if !b.keep(p, gen) {
-		return nil, ErrDown
-	}
-	return p, nil
-}
-
 func portOf(address string) (int, error) {
 	_, port, err := net.SplitHostPort(address)
 	if err != nil {

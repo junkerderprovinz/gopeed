@@ -90,7 +90,9 @@ func (f *Fetcher) initClient() (err error) {
 	// of the local network and WebRTC opens sockets of its own, so both stay
 	// off on a client built bound.
 	binder.SetInterface(f.config.Interface)
+	builtFor = f.config.Interface
 	bound := f.config.Interface != ""
+	cfg.DisableIPv4, cfg.DisableIPv6 = familiesOff(binder.State())
 	cfg.NoDefaultPortForwarding = bound
 	cfg.DisableWebtorrent = bound
 	proxy := f.ctl.GetProxy(f.meta.Req.Proxy)
@@ -108,6 +110,9 @@ func (f *Fetcher) initClient() (err error) {
 		}
 		return dnsResolver.DialContext(ctx, network, addr)
 	}
+	// The client panics when it cannot open a tracker's socket. These open
+	// even while the interface is down or has no address of the family, and
+	// follow it when it changes.
 	cfg.TrackerListenPacket = binder.ListenPacket
 	cfg.HTTPDialContext = binder.DialContext
 	cfg.ListenPacket = func(network, addr string) (net.PacketConn, error) {
@@ -231,7 +236,7 @@ func (f *Fetcher) Meta() *fetcher.FetcherMeta {
 func (f *Fetcher) Stats() any {
 	var stats torrent.TorrentStats
 	if f.torrent != nil {
-		stats = f.torrent.Stats()
+		stats = f.torrentStats()
 	} else {
 		stats = torrent.TorrentStats{}
 	}
@@ -457,6 +462,14 @@ func (f *Fetcher) WaitUpload() (err error) {
 }
 
 func (f *Fetcher) addTorrent(req *base.Request, fromUpload bool) (err error) {
+	// anacrolix/torrent panics on input it takes for impossible, and Start
+	// and Upload call this on the downloader's own goroutines, where a panic
+	// ends the process.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("the torrent library refused this torrent: %v", r)
+		}
+	}()
 	if err = base.ParseReqExtra[bt.ReqExtra](req); err != nil {
 		return
 	}
@@ -691,8 +704,9 @@ func (fm *FetcherManager) Close() error {
 }
 
 // ApplyConfig sets the upload limit and the network interface on running torrents.
-// Port, DHT and PEX are fixed when the client is built, and so are UPnP and WebRTC,
-// which follow the interface; an idle client is closed and rebuilt by the next task.
+// Port, DHT and PEX are fixed when the client is built, and so are UPnP, WebRTC and
+// the address families, which follow the interface; an idle client is closed and
+// rebuilt by the next task.
 func (fm *FetcherManager) ApplyConfig(getConfig func(v any)) {
 	var c config
 	getConfig(&c)
@@ -715,7 +729,7 @@ func (fm *FetcherManager) ApplyConfig(getConfig func(v any)) {
 		return
 	}
 	if (c.ListenPort != 0 && cfg.ListenPort != c.ListenPort) || cfg.NoDHT != c.DisableDHT || cfg.DisablePEX != c.DisablePEX ||
-		cfg.DisableWebtorrent != (c.Interface != "") {
+		builtFor != c.Interface {
 		doCloseClient()
 	}
 }

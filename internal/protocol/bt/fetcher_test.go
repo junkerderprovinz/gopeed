@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	gohttp "net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -498,9 +499,14 @@ func TestFetcherManager_ApplyConfig_Interface(t *testing.T) {
 	if _, err := cfg.TrackerDialContext(context.Background(), "tcp", "127.0.0.1:1"); !errors.Is(err, netbind.ErrDown) {
 		t.Errorf("tracker dial with the interface missing: %v, want netbind.ErrDown", err)
 	}
-	if _, err := cfg.TrackerListenPacket("udp4", ":0"); !errors.Is(err, netbind.ErrDown) {
-		t.Errorf("tracker socket with the interface missing: %v, want netbind.ErrDown", err)
+	tracker, err := cfg.TrackerListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("tracker socket with the interface missing: %v", err)
 	}
+	if _, err := tracker.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); !errors.Is(err, netbind.ErrDown) {
+		t.Errorf("the tracker socket sent with the interface missing: %v, want netbind.ErrDown", err)
+	}
+	tracker.Close()
 	sockets := 0
 	for _, d := range client.Listeners() {
 		if pc, ok := d.(net.PacketConn); ok {
@@ -523,6 +529,55 @@ func TestFetcherManager_ApplyConfig_Interface(t *testing.T) {
 	}
 }
 
+func TestATorrentWithAUDPTrackerWaitsWhileTheInterfaceIsMissing(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeClient() })
+	f := buildConfigFetcherWith(config{Interface: "gopeed-missing0"})
+	err := f.Resolve(&base.Request{
+		URL:   "./testdata/test.torrent",
+		Extra: bt.ReqExtra{Trackers: []string{"udp://127.0.0.1:1/announce"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Resolve with the interface missing: %v", err)
+	}
+	for _, network := range []string{"udp4", "udp6"} {
+		pc, err := cfg.TrackerListenPacket(network, ":0")
+		if err != nil {
+			t.Fatalf("tracker socket for %s with the interface missing: %v", network, err)
+		}
+		if _, err := pc.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); !errors.Is(err, netbind.ErrDown) {
+			t.Errorf("the %s tracker socket sent with the interface missing: %v, want netbind.ErrDown", network, err)
+		}
+		pc.Close()
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAClientLeavesOutTheFamiliesTheInterfaceHasNoAddressOf(t *testing.T) {
+	v4 := netip.MustParseAddr("10.2.0.2")
+	v6 := netip.MustParseAddr("fd00::2")
+	cases := []struct {
+		name       string
+		st         netbind.State
+		off4, off6 bool
+	}{
+		{"any interface", netbind.State{Up: true}, false, false},
+		{"IPv4 only", netbind.State{Interface: "wg0", Up: true, Addrs: []netip.Addr{v4}}, false, true},
+		{"IPv6 only", netbind.State{Interface: "wg0", Up: true, Addrs: []netip.Addr{v6}}, true, false},
+		{"both", netbind.State{Interface: "wg0", Up: true, Addrs: []netip.Addr{v4, v6}}, false, false},
+		{"down", netbind.State{Interface: "wg0"}, false, false},
+	}
+	for _, c := range cases {
+		if off4, off6 := familiesOff(c.st); off4 != c.off4 || off6 != c.off6 {
+			t.Errorf("%s: IPv4 off %v, IPv6 off %v, want %v and %v", c.name, off4, off6, c.off4, c.off6)
+		}
+	}
+}
+
 func mockConfig(c config) func(v any) {
 	return func(v any) {
 		json.Unmarshal([]byte(test.ToJson(c)), v)
@@ -535,4 +590,12 @@ func buildConfigFetcherWith(c config) fetcher.Fetcher {
 	newController.GetConfig = mockConfig(c)
 	fetcher.Setup(newController)
 	return fetcher
+}
+
+func TestATorrentTheLibraryPanicsOnFailsInsteadOfCrashing(t *testing.T) {
+	f := buildFetcher()
+	err := f.Resolve(&base.Request{URL: "magnet:?xt=urn:btih:0000000000000000000000000000000000000000"}, nil)
+	if err == nil {
+		t.Fatal("Resolve of a zero info hash succeeded, want an error")
+	}
 }

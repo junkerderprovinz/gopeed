@@ -7,7 +7,7 @@ This branch is the gopeed that [KnightLoader](https://github.com/junkerderprovin
 - `ConfigurableFetcherManager.ApplyConfig`, so a protocol can pick up config changes without waiting for the next task.
 - A fix for a panic when the BitTorrent client is closed right after it was built.
 - Locking for the task list and for task status and progress, which the downloader's own goroutines read while other calls change them.
-- Binding BitTorrent traffic to one network interface (`pkg/netbind`): peers, trackers and the DHT use only that interface, and nothing is sent or received while it is missing or down.
+- Binding BitTorrent traffic to one network interface (`pkg/netbind`): peers, trackers and the DHT use only that interface, and nothing is sent or received while it is missing or down. Tracker sockets open and wait in that state rather than fail, and a panic of anacrolix/torrent while a torrent is added becomes the task's error.
 
 KnightLoader pins the branch with a `replace` directive in its `go.mod` that points at a commit here. Because this is the fork's default branch, Renovate in KnightLoader proposes the new head whenever the branch moves.
 

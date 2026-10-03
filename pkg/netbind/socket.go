@@ -28,6 +28,9 @@ type follower[T interface{ Close() error }] struct {
 	network string
 	port    int
 	listen  func(name string, l link, at netip.Addr, port int) (T, int, error)
+	// waits makes a socket that cannot be bound wait without an interface
+	// too, rather than fail to open.
+	waits bool
 
 	mu     sync.Mutex
 	cur    bound[T]
@@ -101,10 +104,10 @@ func (f *follower[T]) close() error {
 }
 
 // start binds the first system socket. Without an interface its error is the
-// system's, so a caller can tell an unsupported family as it would from
-// net.Listen; with one, a socket that cannot be bound yet waits for the
-// interface. A port of 0 is settled here either way, so a later rebind lands
-// on the same port.
+// system's unless the socket waits, so a caller can tell an unsupported family
+// as it would from net.Listen; with one, a socket that cannot be bound yet
+// waits for the interface. A port of 0 is settled here either way, so a later
+// rebind lands on the same port.
 func (f *follower[T]) start() error {
 	name, l, _ := f.b.now()
 	f.wake = make(chan struct{})
@@ -114,7 +117,7 @@ func (f *follower[T]) start() error {
 		if err == nil {
 			f.cur = bound[T]{inner: s, open: true, at: at, index: l.index}
 			f.port = port
-		} else if name == "" {
+		} else if name == "" && !f.waits {
 			return err
 		}
 	}
@@ -167,7 +170,23 @@ func unspecified(network string, port int) netip.AddrPort {
 // neither sending nor receiving while there is none. network is "udp4" or
 // "udp6"; a port of 0 is picked once and kept.
 func (b *Binder) PacketConn(network string, port int) (net.PacketConn, error) {
-	p := &packetConn{follower: follower[net.PacketConn]{b: b, network: network, port: port}}
+	return b.packetConn(network, port, false)
+}
+
+// ListenPacket opens a packet socket the way net.ListenPacket would, with only
+// the port of address used, that follows the interface as PacketConn does. It
+// opens even while there is nothing of network's family to bind to, and
+// starts sending once there is.
+func (b *Binder) ListenPacket(network, address string) (net.PacketConn, error) {
+	port, err := portOf(address)
+	if err != nil {
+		return nil, err
+	}
+	return b.packetConn(network, port, true)
+}
+
+func (b *Binder) packetConn(network string, port int, waits bool) (net.PacketConn, error) {
+	p := &packetConn{follower: follower[net.PacketConn]{b: b, network: network, port: port, waits: waits}}
 	p.listen = func(name string, l link, at netip.Addr, port int) (net.PacketConn, int, error) {
 		pc, err := listenPacket(name, l, network, at, port)
 		if err != nil {

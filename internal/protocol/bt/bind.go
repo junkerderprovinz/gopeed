@@ -16,6 +16,28 @@ func init() {
 	binder.Watch(saveSwarms, restoreSwarms)
 }
 
+// builtFor is the interface the client was built bound to, guarded by lock
+// like client.
+var builtFor string
+
+// familiesOff reports the address families a client built on st leaves out:
+// those the interface has no address of. While the interface is down nothing
+// is known of its families, so the client keeps both and its sockets wait.
+func familiesOff(st netbind.State) (v4, v6 bool) {
+	if st.Interface == "" || !st.Up {
+		return false, false
+	}
+	v4, v6 = true, true
+	for _, a := range st.Addrs {
+		if a.Is4() {
+			v4 = false
+		} else {
+			v6 = false
+		}
+	}
+	return v4, v6
+}
+
 // peerListener is a TCP listener for peers with the network it listens on.
 type peerListener struct {
 	net.Listener

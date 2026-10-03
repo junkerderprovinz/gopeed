@@ -178,8 +178,13 @@ func TestNothingIsDialledWhileTheInterfaceIsMissing(t *testing.T) {
 			t.Fatalf("dial %s with the interface missing: %v, want ErrDown", network, err)
 		}
 	}
-	if _, err := lb.ListenPacket("udp4", ":0"); !errors.Is(err, ErrDown) {
-		t.Fatalf("ListenPacket with the interface missing: %v, want ErrDown", err)
+	pc, err := lb.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("ListenPacket with the interface missing: %v", err)
+	}
+	defer pc.Close()
+	if _, err := pc.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); !errors.Is(err, ErrDown) {
+		t.Fatalf("send with the interface missing: %v, want ErrDown", err)
 	}
 	time.Sleep(50 * time.Millisecond)
 	if n := accepted(); n != 0 {

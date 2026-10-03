@@ -182,12 +182,13 @@ func New() *Binder {
 // are closed. While a name is set, the interface is looked at every
 // PollInterval.
 func (b *Binder) SetInterface(name string) {
+	b.refreshMu.Lock()
+	defer b.refreshMu.Unlock()
 	b.mu.Lock()
 	if name == b.name {
 		b.mu.Unlock()
 		return
 	}
-	b.name = name
 	if b.stop != nil {
 		close(b.stop)
 		b.stop = nil
@@ -197,7 +198,7 @@ func (b *Binder) SetInterface(name string) {
 		go b.poll(b.stop)
 	}
 	b.mu.Unlock()
-	b.Refresh()
+	b.apply(name)
 }
 
 func (b *Binder) poll(stop chan struct{}) {
@@ -220,18 +221,25 @@ func (b *Binder) Refresh() {
 	b.mu.Lock()
 	name := b.name
 	b.mu.Unlock()
+	b.apply(name)
+}
+
+// apply looks name up and makes it the interface, so that nobody sees the
+// name with another interface's link. It must be called with refreshMu held.
+func (b *Binder) apply(name string) {
 	l := link{up: true}
 	if name != "" {
 		l = b.lookup(name)
 	}
 
 	b.mu.Lock()
-	changed := l != b.cur || b.gen == 0
+	changed := l != b.cur || name != b.name || b.gen == 0
 	var drop []io.Closer
 	if changed {
 		if l.up != b.cur.up {
 			b.since = time.Now()
 		}
+		b.name = name
 		b.cur = l
 		b.gen++
 		for c := range b.conns {
@@ -331,16 +339,4 @@ type conn struct {
 func (c *conn) Close() error {
 	c.once.Do(func() { c.b.forget(c) })
 	return c.Conn.Close()
-}
-
-// packet is a one-off packet socket closed when the interface changes.
-type packet struct {
-	net.PacketConn
-	b    *Binder
-	once sync.Once
-}
-
-func (p *packet) Close() error {
-	p.once.Do(func() { p.b.forget(p) })
-	return p.PacketConn.Close()
 }
