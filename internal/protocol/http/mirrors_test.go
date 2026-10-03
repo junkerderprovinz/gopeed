@@ -187,3 +187,39 @@ func TestFetcher_DeadMirrorsLeaveTheURLItsShareOfConnections(t *testing.T) {
 		t.Fatalf("the URL served %d ranges at once, want its share of 1", p)
 	}
 }
+
+// The URL that answered the resolve may still refuse every range. Its share
+// then goes to the mirrors instead of the first one carrying the file alone.
+func TestFetcher_URLRefusingRangesLeavesTheDownloadToAllMirrors(t *testing.T) {
+	data := randomData(t, 8<<20)
+	primary := gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		if r.Header.Get("Range") != "" {
+			w.WriteHeader(gohttp.StatusGone)
+			return
+		}
+		gohttp.ServeContent(slowWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
+	})
+	sa := httptest.NewServer(primary)
+	defer sa.Close()
+	var copies []*source
+	var mirrors []string
+	for range 2 {
+		c := &source{data: data}
+		s := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+			c.ServeHTTP(slowWriter{w}, r)
+		}))
+		defer s.Close()
+		copies = append(copies, c)
+		mirrors = append(mirrors, s.URL+"/mirror.data")
+	}
+
+	got := fetchWithMirrors(t, 4, sa.URL+"/mirror.data", mirrors...)
+	if !bytes.Equal(got, data) {
+		t.Fatal("the file differs from the source")
+	}
+	for i, c := range copies {
+		if c.ranged.Load() == 0 {
+			t.Fatalf("mirror %d was never asked for a range", i+1)
+		}
+	}
+}

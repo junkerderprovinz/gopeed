@@ -993,9 +993,9 @@ func (f *Fetcher) runConnection(conn *connection) {
 			f.connMu.Lock()
 			conn.failed = true
 			f.connMu.Unlock()
-			if f.slowStart != nil {
-				f.slowStart.onConnectFailed()
-			}
+			// A failure the connection retries leaves its place in the slow
+			// start batch open, or the batch would end the expansion while
+			// the connection may still get going on another source.
 			if conn.retryTimes >= 3 {
 				if f.switchSource(conn, true) {
 					retries, stuck = 0, 0
@@ -1004,6 +1004,9 @@ func (f *Fetcher) runConnection(conn *connection) {
 				f.connMu.Lock()
 				conn.State = connFailed
 				f.connMu.Unlock()
+				if f.slowStart != nil {
+					f.slowStart.onConnectFailed()
+				}
 				return
 			}
 		} else if stuck >= 3 && f.switchSource(conn, true) {
