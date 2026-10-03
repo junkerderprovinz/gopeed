@@ -11,6 +11,8 @@ import (
 // DnsCacheResolver resolves DNS requests for an HTTP client using an in-memory cache.
 type DnsCacheResolver struct {
 	RefreshTimeout time.Duration
+	// Dial dials each resolved address in turn, a plain net.Dialer when nil.
+	Dial func(ctx context.Context, network, address string) (net.Conn, error)
 
 	resolver dnscache.Resolver
 }
@@ -24,10 +26,14 @@ func (r *DnsCacheResolver) DialContext(ctx context.Context, network, address str
 	if err != nil {
 		return nil, err
 	}
+	dial := r.Dial
+	if dial == nil {
+		var dialer net.Dialer
+		dial = dialer.DialContext
+	}
 	var conn net.Conn
 	for _, ip := range ips {
-		var dialer net.Dialer
-		conn, err = dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		conn, err = dial(ctx, network, net.JoinHostPort(ip, port))
 		if err == nil {
 			break
 		}

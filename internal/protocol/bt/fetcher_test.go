@@ -1,20 +1,33 @@
 package bt
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
 	gohttp "net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/GopeedLab/gopeed/internal/controller"
 	"github.com/GopeedLab/gopeed/internal/fetcher"
 	"github.com/GopeedLab/gopeed/internal/test"
 	"github.com/GopeedLab/gopeed/pkg/base"
+	"github.com/GopeedLab/gopeed/pkg/netbind"
 	"github.com/GopeedLab/gopeed/pkg/protocol/bt"
+	"github.com/anacrolix/torrent/tracker"
+	"github.com/anacrolix/torrent/tracker/udp"
 	"golang.org/x/time/rate"
 )
 
@@ -474,6 +487,105 @@ func TestFetcherManager_ApplyConfig_Rebuild(t *testing.T) {
 	}
 }
 
+func TestFetcherManager_ApplyConfig_Interface(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	fm := new(FetcherManager)
+	f := buildFetcher()
+	if err := f.Resolve(&base.Request{URL: "./testdata/test.torrent"}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	fm.ApplyConfig(mockConfig(config{Interface: "gopeed-missing0"}))
+	if client == nil {
+		t.Fatal("ApplyConfig() closed a client with active torrents")
+	}
+	if st := binder.State(); st.Interface != "gopeed-missing0" || st.Up {
+		t.Fatalf("binder state = %+v, want the missing interface, down", st)
+	}
+	if _, err := cfg.TrackerDialContext(context.Background(), "tcp", "127.0.0.1:1"); !errors.Is(err, netbind.ErrDown) {
+		t.Errorf("tracker dial with the interface missing: %v, want netbind.ErrDown", err)
+	}
+	tracker, err := cfg.TrackerListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("tracker socket with the interface missing: %v", err)
+	}
+	if _, err := tracker.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); !errors.Is(err, netbind.ErrDown) {
+		t.Errorf("the tracker socket sent with the interface missing: %v, want netbind.ErrDown", err)
+	}
+	tracker.Close()
+	sockets := 0
+	for _, d := range client.Listeners() {
+		if pc, ok := d.(net.PacketConn); ok {
+			sockets++
+			if _, err := pc.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); err == nil {
+				t.Errorf("the %s socket sent with the interface missing", d.Addr().Network())
+			}
+		}
+	}
+	if sockets == 0 {
+		t.Error("the client has no UDP socket to check")
+	}
+
+	fm.ApplyConfig(mockConfig(config{}))
+	if st := binder.State(); st.Interface != "" || !st.Up {
+		t.Fatalf("binder state = %+v, want any interface, up", st)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestATorrentWithAUDPTrackerWaitsWhileTheInterfaceIsMissing(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeClient() })
+	f := buildConfigFetcherWith(config{Interface: "gopeed-missing0"})
+	err := f.Resolve(&base.Request{
+		URL:   "./testdata/test.torrent",
+		Extra: bt.ReqExtra{Trackers: []string{"udp://127.0.0.1:1/announce"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Resolve with the interface missing: %v", err)
+	}
+	for _, network := range []string{"udp4", "udp6"} {
+		pc, err := cfg.TrackerListenPacket(network, ":0")
+		if err != nil {
+			t.Fatalf("tracker socket for %s with the interface missing: %v", network, err)
+		}
+		if _, err := pc.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); !errors.Is(err, netbind.ErrDown) {
+			t.Errorf("the %s tracker socket sent with the interface missing: %v, want netbind.ErrDown", network, err)
+		}
+		pc.Close()
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAClientLeavesOutTheFamiliesTheInterfaceHasNoAddressOf(t *testing.T) {
+	v4 := netip.MustParseAddr("10.2.0.2")
+	v6 := netip.MustParseAddr("fd00::2")
+	cases := []struct {
+		name       string
+		st         netbind.State
+		off4, off6 bool
+	}{
+		{"any interface", netbind.State{Up: true}, false, false},
+		{"IPv4 only", netbind.State{Interface: "wg0", Up: true, Addrs: []netip.Addr{v4}}, false, true},
+		{"IPv6 only", netbind.State{Interface: "wg0", Up: true, Addrs: []netip.Addr{v6}}, true, false},
+		{"both", netbind.State{Interface: "wg0", Up: true, Addrs: []netip.Addr{v4, v6}}, false, false},
+		{"down", netbind.State{Interface: "wg0"}, false, false},
+	}
+	for _, c := range cases {
+		if off4, off6 := familiesOff(c.st); off4 != c.off4 || off6 != c.off6 {
+			t.Errorf("%s: IPv4 off %v, IPv6 off %v, want %v and %v", c.name, off4, off6, c.off4, c.off6)
+		}
+	}
+}
+
 func mockConfig(c config) func(v any) {
 	return func(v any) {
 		json.Unmarshal([]byte(test.ToJson(c)), v)
@@ -486,4 +598,189 @@ func buildConfigFetcherWith(c config) fetcher.Fetcher {
 	newController.GetConfig = mockConfig(c)
 	fetcher.Setup(newController)
 	return fetcher
+}
+
+func TestATorrentTheLibraryPanicsOnFailsInsteadOfCrashing(t *testing.T) {
+	f := buildFetcher()
+	err := f.Resolve(&base.Request{URL: "magnet:?xt=urn:btih:0000000000000000000000000000000000000000"}, nil)
+	if err == nil {
+		t.Fatal("Resolve of a zero info hash succeeded, want an error")
+	}
+}
+
+func TestClosingTheClientFreesTheTrackerSockets(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeClient() })
+	tracker, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	f := buildFetcher()
+	err = f.Resolve(&base.Request{
+		URL:   "./testdata/test.torrent",
+		Extra: bt.ReqExtra{Trackers: []string{"udp://" + tracker.LocalAddr().String() + "/announce"}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracker.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, from, err := tracker.ReadFrom(make([]byte, 2048))
+	if err != nil {
+		t.Fatalf("no packet from the tracker socket: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	port := from.(*net.UDPAddr).Port
+	pc, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("port %d of the tracker socket is still taken after the client closed: %v", port, err)
+	}
+	pc.Close()
+}
+
+func TestAMagnetGivenUpOnWhileItWaitsForItsFilesLeavesTheClient(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeClient() })
+	f := buildConfigFetcherWith(config{DisableDHT: true}).(*Fetcher)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- f.ResolveContext(ctx, &base.Request{URL: "magnet:?xt=urn:btih:" + strings.Repeat("ab", 20)}, nil)
+	}()
+	for deadline := time.Now().Add(5 * time.Second); !inClient(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the magnet never reached the client")
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ResolveContext() got = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ResolveContext() still waits for the file list after its context ended")
+	}
+	if inClient() {
+		t.Error("the magnet stayed in the client")
+	}
+}
+
+// inClient reports whether the client holds a torrent.
+func inClient() bool {
+	lock.Lock()
+	defer lock.Unlock()
+	return client != nil && len(client.Torrents()) > 0
+}
+
+func TestTheClientLeavesTheWorkingDirectoryAlone(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	t.Chdir(dir)
+	f := buildFetcher().(*Fetcher)
+	f.meta.Req = &base.Request{}
+	lock.Lock()
+	err := f.initClient()
+	lock.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		t.Errorf("the client left %s in the working directory", e.Name())
+	}
+}
+
+// udpEventTracker is a UDP tracker that keeps the events of the announces it
+// is sent and asks for one every second.
+func udpEventTracker(t *testing.T) (string, func() []tracker.AnnounceEvent) {
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	var mu sync.Mutex
+	var events []tracker.AnnounceEvent
+	go func() {
+		b := make([]byte, 0x10000)
+		for {
+			n, addr, err := pc.ReadFrom(b)
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			r := bytes.NewReader(b[:n])
+			var h udp.RequestHeader
+			if err != nil || udp.Read(r, &h) != nil {
+				continue
+			}
+			var resp bytes.Buffer
+			udp.Write(&resp, udp.ResponseHeader{Action: h.Action, TransactionId: h.TransactionId})
+			switch h.Action {
+			case udp.ActionConnect:
+				udp.Write(&resp, udp.ConnectionResponse{ConnectionId: 1})
+			case udp.ActionAnnounce:
+				var req udp.AnnounceRequest
+				if udp.Read(r, &req) != nil {
+					continue
+				}
+				mu.Lock()
+				events = append(events, req.Event)
+				mu.Unlock()
+				udp.Write(&resp, udp.AnnounceResponseHeader{Interval: 1})
+			default:
+				continue
+			}
+			pc.WriteTo(resp.Bytes(), addr)
+		}
+	}()
+	return "udp://" + pc.LocalAddr().String() + "/announce", func() []tracker.AnnounceEvent {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(events)
+	}
+}
+
+func TestClosingTheLastTorrentTellsItsUDPTrackerItStopped(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeClient() })
+	url, events := udpEventTracker(t)
+	f := buildFetcher()
+	err := f.Resolve(&base.Request{
+		URL:   "./testdata/test.torrent",
+		Extra: bt.ReqExtra{Trackers: []string{url}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second announce means the answer to the first one has been taken in.
+	for deadline := time.Now().Add(10 * time.Second); len(events()) < 2; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the tracker got %v, want two announces", events())
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := events(); !slices.Contains(got, tracker.Stopped) {
+		t.Errorf("the tracker got %v, want a stopped once the client closed", got)
+	}
 }
