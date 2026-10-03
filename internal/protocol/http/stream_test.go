@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	gohttp "net/http"
 	"net/http/httptest"
@@ -41,6 +42,21 @@ func (w slowWriter) Write(p []byte) (int, error) {
 // slowServer serves data with ranges, each response at rate bytes a second.
 func slowServer(t *testing.T, data []byte, rate int) *httptest.Server {
 	srv := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		gohttp.ServeContent(slowWriter{w, rate}, r, "media.bin", time.Time{}, bytes.NewReader(data))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// refusingServer is slowServer answering 403 to every range that starts at or
+// past refuseFrom.
+func refusingServer(t *testing.T, data []byte, rate int, refuseFrom int64) *httptest.Server {
+	srv := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		var from int64
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-", &from); err == nil && from >= refuseFrom {
+			w.WriteHeader(gohttp.StatusForbidden)
+			return
+		}
 		gohttp.ServeContent(slowWriter{w, rate}, r, "media.bin", time.Time{}, bytes.NewReader(data))
 	}))
 	t.Cleanup(srv.Close)
@@ -235,5 +251,48 @@ func TestStream_FinishedFileCanBeRenamedWhileAReaderHoldsIt(t *testing.T) {
 	}
 	if !bytes.Equal(got, data[1024:2048]) {
 		t.Fatal("the reader read other bytes after the rename")
+	}
+}
+
+// A reader waiting on a range the server refuses moves a connection there
+// again and again, and each time the parked one is started once more after
+// every connection has stopped. Only one goroutine may wait for that.
+func TestStream_ReaderAtARefusedRangeKeepsTheDownloadRunning(t *testing.T) {
+	const size = 2 << 20
+	for round := range 8 {
+		t.Run(fmt.Sprint(round), func(t *testing.T) {
+			t.Parallel()
+			data := testData(size)
+			// The first connection takes the first half and leaves too little
+			// to split again, while the second is refused its half.
+			f := startStreamFetcher(t, refusingServer(t, data, 128<<10, size/2), 4)
+			if err := f.Start(); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for f.getState() != stateSteady {
+				if time.Now().After(deadline) {
+					t.Fatalf("the download never settled on its connections: state %v", f.getState())
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			r, err := f.Stream(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			got, err := readAtCtx(ctx, r, size*3/4, 1024)
+			if len(got) > 0 || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("read of a refused range: %d bytes, %v; want nothing until the deadline", len(got), err)
+			}
+			select {
+			case err := <-f.doneCh:
+				t.Fatalf("the download reported its end (%v) while its first connection was still fetching", err)
+			default:
+			}
+		})
 	}
 }
