@@ -88,7 +88,9 @@ func (f *Fetcher) availableLocked(pos int64, want int) int64 {
 	size := f.meta.Res.Size
 	limit := min(size, pos+int64(want))
 	switch {
-	case f.getState() == stateDone:
+	// A ranged download is done once its connections have stopped, which
+	// leaves a range refused with 403 unwritten.
+	case f.getState() == stateDone && !f.meta.Res.Range:
 	case !f.meta.Res.Range:
 		if len(f.connections) == 0 {
 			return 0
