@@ -205,3 +205,35 @@ func TestStream_RefusesAFileOtherThanTheFirst(t *testing.T) {
 		t.Fatal("an HTTP download was streamed as a second file")
 	}
 }
+
+func TestStream_FinishedFileCanBeRenamedWhileAReaderHoldsIt(t *testing.T) {
+	data := testData(1 << 20)
+	f := startStreamFetcher(t, slowServer(t, data, 8<<20), 1)
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := f.Stream(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := r.Read(make([]byte, 1024)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	from := filepath.Join(f.meta.Opts.Path, "media.bin")
+	to := filepath.Join(f.meta.Opts.Path, "renamed.bin")
+	if err := os.Rename(from, to); err != nil {
+		t.Fatalf("rename with a reader open: %v", err)
+	}
+	got, err := readAtCtx(context.Background(), r, 1024, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data[1024:2048]) {
+		t.Fatal("the reader read other bytes after the rename")
+	}
+}

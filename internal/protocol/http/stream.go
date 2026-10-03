@@ -288,7 +288,7 @@ func (r *streamReader) ReadContext(ctx context.Context, p []byte) (int, error) {
 
 func (r *streamReader) readAt(p []byte) (int, error) {
 	if r.file == nil {
-		file, err := os.Open(r.f.meta.SingleFilepath())
+		file, err := openShared(r.f.meta.SingleFilepath())
 		if err != nil {
 			return 0, err
 		}
