@@ -1601,3 +1601,15 @@ func TestFetcher_Patch_CookieExpired(t *testing.T) {
 		t.Errorf("File MD5 mismatch: got %v, want %v", got, want)
 	}
 }
+
+func TestSlowStart_BatchSettlesWhenTheLastPendingConnectionFails(t *testing.T) {
+	s := newSlowStartController(8)
+	s.commitBatch(2)
+	s.onConnectSuccess()
+	s.onConnectFailed()
+	select {
+	case <-s.expansionCh:
+	default:
+		t.Fatal("the batch was left waiting for a connection that gave up")
+	}
+}

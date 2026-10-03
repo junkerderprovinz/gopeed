@@ -166,9 +166,9 @@ func (s *slowStartController) onConnectFailed() {
 	if s.batchPending > 0 {
 		s.batchPending--
 	}
-	// If all pending resolved (success or fail), trigger expansion
-	// This handles both successful completion and all-failures case
-	if s.batchPending == 0 {
+	// A failure takes the connection out of the batch, which is then
+	// settled once the ones left have all answered, as in onConnectSuccess.
+	if s.batchReady >= s.batchPending {
 		select {
 		case s.expansionCh <- struct{}{}:
 		default:
