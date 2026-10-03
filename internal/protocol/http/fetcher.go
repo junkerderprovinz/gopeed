@@ -102,8 +102,10 @@ type connection struct {
 	lastErr    error
 
 	// source is the URL the connection asks: 0 is the request's own, i its
-	// mirror i-1.
-	source int
+	// mirror i-1. claimed says the connection counts against that source's
+	// share.
+	source  int
+	claimed bool
 
 	// Speed tracking for work stealing decisions
 	speed             int64 // bytes per second
@@ -229,6 +231,10 @@ type Fetcher struct {
 	// deadSources are the sources that kept failing; no connection asks them
 	// again. Guarded by connMu.
 	deadSources map[int]bool
+	// sourceLoad counts the connections each source holds, and sourceFreed
+	// is closed when one lets go. Guarded by connMu.
+	sourceLoad  map[int]int
+	sourceFreed chan struct{}
 
 	// Slow start controller
 	slowStart *slowStartController
@@ -859,19 +865,26 @@ func (f *Fetcher) expandConnections() {
 			break
 		}
 
+		connID := len(f.connections)
+		source := 0
+		if n := f.sourceCount(); n > 1 {
+			if source = f.openSourceLocked(connID%n, -1); source < 0 {
+				break
+			}
+		}
+
 		// Split the work: new connection takes the latter half
 		splitPoint := maxRemainConn.Chunk.End - maxRemainConn.Chunk.remain()/2
 		newChunk := newChunk(splitPoint+1, maxRemainConn.Chunk.End)
 		maxRemainConn.Chunk.End = splitPoint
 
-		connID := len(f.connections)
 		conn := &connection{
-			ID:     connID,
-			Role:   roleWorker,
-			State:  connNotStarted,
-			Chunk:  newChunk,
-			source: f.liveSourceLocked(connID % f.sourceCount()),
+			ID:    connID,
+			Role:  roleWorker,
+			State: connNotStarted,
+			Chunk: newChunk,
 		}
+		f.holdSourceLocked(conn, source)
 		conn.ctx, conn.cancel = context.WithCancel(f.ctx)
 
 		newConns = append(newConns, conn)
@@ -899,6 +912,11 @@ func (f *Fetcher) expandConnections() {
 
 func (f *Fetcher) runConnection(conn *connection) {
 	defer f.wg.Done()
+	defer func() {
+		f.connMu.Lock()
+		f.releaseSourceLocked(conn)
+		f.connMu.Unlock()
+	}()
 
 	f.connMu.Lock()
 	conn.State = connConnecting
@@ -920,6 +938,9 @@ func (f *Fetcher) runConnection(conn *connection) {
 			client = f.buildFastFailClient()
 		}
 
+		if !f.takeSource(conn) {
+			return
+		}
 		before := conn.Downloaded
 		err := f.downloadChunkOnce(conn, client, buf)
 		if conn.Downloaded > before {
@@ -1011,37 +1032,112 @@ func (f *Fetcher) sourceCount() int {
 	return 1
 }
 
-// liveSourceLocked is want, or the first source after it that has not been
-// given up. switchSource keeps one source alive, so there always is one.
-// Caller holds connMu.
-func (f *Fetcher) liveSourceLocked(want int) int {
+// sourceShare is how many connections one of n sources may hold: the
+// connections dealt out evenly. A source that dies does not pass its share
+// on, since a hoster may count an account's connections.
+func (f *Fetcher) sourceShare(n int) int {
+	conns := f.meta.Opts.Extra.(*fhttp.OptsExtra).Connections
+	return max(1, (conns+n-1)/n)
+}
+
+// openSourceLocked is the first source from from on that is still in use, is
+// not skip and holds less than its share, or -1 when there is none. Caller
+// holds connMu.
+func (f *Fetcher) openSourceLocked(from, skip int) int {
 	n := f.sourceCount()
+	share := f.sourceShare(n)
 	for i := range n {
-		if s := (want + i) % n; !f.deadSources[s] {
+		s := (from + i) % n
+		if s != skip && !f.deadSources[s] && f.sourceLoad[s] < share {
 			return s
 		}
 	}
-	return want
+	return -1
 }
 
-// switchSource moves conn to the next source still in use, and with drop
-// gives up the one it leaves. It reports false when there is no other
-// source, and then changes nothing.
+// holdSourceLocked moves conn's place to source s. Caller holds connMu.
+func (f *Fetcher) holdSourceLocked(conn *connection, s int) {
+	f.releaseSourceLocked(conn)
+	if f.sourceLoad == nil {
+		f.sourceLoad = map[int]int{}
+	}
+	f.sourceLoad[s]++
+	conn.source, conn.claimed = s, true
+}
+
+// releaseSourceLocked gives up conn's place on its source and wakes the
+// connections waiting for one. Caller holds connMu.
+func (f *Fetcher) releaseSourceLocked(conn *connection) {
+	if !conn.claimed {
+		return
+	}
+	conn.claimed = false
+	f.sourceLoad[conn.source]--
+	if f.sourceFreed != nil {
+		close(f.sourceFreed)
+		f.sourceFreed = nil
+	}
+}
+
+// takeSource makes sure conn holds a place on a source still in use, and
+// waits while every such source is at its share. It reports false when the
+// connection is stopped first.
+func (f *Fetcher) takeSource(conn *connection) bool {
+	for {
+		f.connMu.Lock()
+		if f.sourceCount() == 1 || (conn.claimed && !f.deadSources[conn.source]) {
+			f.connMu.Unlock()
+			return true
+		}
+		if s := f.openSourceLocked(conn.source, -1); s >= 0 {
+			f.holdSourceLocked(conn, s)
+			f.connMu.Unlock()
+			return true
+		}
+		f.releaseSourceLocked(conn)
+		// Unknown speed marks its chunk as one the others take work from.
+		conn.speed = 0
+		if f.sourceFreed == nil {
+			f.sourceFreed = make(chan struct{})
+		}
+		freed := f.sourceFreed
+		f.connMu.Unlock()
+		select {
+		case <-freed:
+		case <-conn.ctx.Done():
+			return false
+		}
+	}
+}
+
+// switchSource moves conn off its source. With drop the source is given up
+// and conn takes or waits for a place on another in takeSource. Without it
+// the source stays in use, and conn moves only to a source with room. It
+// reports false when conn stays where it is.
 func (f *Fetcher) switchSource(conn *connection, drop bool) bool {
 	n := f.sourceCount()
 	f.connMu.Lock()
 	defer f.connMu.Unlock()
+	if !drop {
+		s := f.openSourceLocked(conn.source+1, conn.source)
+		if s < 0 {
+			return false
+		}
+		f.holdSourceLocked(conn, s)
+		conn.retryTimes = 0
+		conn.failed = false
+		return true
+	}
 	for i := 1; i < n; i++ {
 		s := (conn.source + i) % n
 		if f.deadSources[s] {
 			continue
 		}
-		if drop {
-			if f.deadSources == nil {
-				f.deadSources = map[int]bool{}
-			}
-			f.deadSources[conn.source] = true
+		if f.deadSources == nil {
+			f.deadSources = map[int]bool{}
 		}
+		f.deadSources[conn.source] = true
+		f.releaseSourceLocked(conn)
 		conn.source = s
 		conn.retryTimes = 0
 		conn.failed = false
@@ -1078,8 +1174,6 @@ func (f *Fetcher) downloadChunkOnce(conn *connection, client *http.Client, buf [
 	}
 	rangeStart := conn.Chunk.Begin + conn.Chunk.Downloaded
 	rangeEnd := conn.Chunk.End
-	// Another connection may have given up this one's source.
-	conn.source = f.liveSourceLocked(conn.source)
 	source := conn.source
 	f.connMu.Unlock()
 

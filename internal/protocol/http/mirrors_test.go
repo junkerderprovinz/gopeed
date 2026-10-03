@@ -44,9 +44,9 @@ func randomData(t *testing.T, n int) []byte {
 	return b
 }
 
-// fetchWithMirrors downloads primary with the mirrors beside it and returns
-// what landed on disk.
-func fetchWithMirrors(t *testing.T, primary string, mirrors ...string) []byte {
+// fetchWithMirrors downloads primary with the mirrors beside it over conns
+// connections and returns what landed on disk.
+func fetchWithMirrors(t *testing.T, conns int, primary string, mirrors ...string) []byte {
 	t.Helper()
 	dir := t.TempDir()
 	f := buildFetcher()
@@ -56,7 +56,7 @@ func fetchWithMirrors(t *testing.T, primary string, mirrors ...string) []byte {
 	}, &base.Options{
 		Name:  "mirror.data",
 		Path:  dir,
-		Extra: &http.OptsExtra{Connections: 6},
+		Extra: &http.OptsExtra{Connections: conns},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +81,7 @@ func TestFetcher_MirrorsShareTheDownload(t *testing.T) {
 	defer sa.Close()
 	defer sb.Close()
 
-	got := fetchWithMirrors(t, sa.URL+"/mirror.data", sb.URL+"/mirror.data")
+	got := fetchWithMirrors(t, 6, sa.URL+"/mirror.data", sb.URL+"/mirror.data")
 	if !bytes.Equal(got, data) {
 		t.Fatal("the file differs from the source")
 	}
@@ -98,7 +98,7 @@ func TestFetcher_DeadMirrorLeavesTheRestToTheURL(t *testing.T) {
 	defer sa.Close()
 	defer sb.Close()
 
-	got := fetchWithMirrors(t, sa.URL+"/mirror.data", sb.URL+"/mirror.data")
+	got := fetchWithMirrors(t, 6, sa.URL+"/mirror.data", sb.URL+"/mirror.data")
 	if !bytes.Equal(got, data) {
 		t.Fatal("the file differs from the source")
 	}
@@ -119,7 +119,7 @@ func TestFetcher_MirrorTakesOverWhenTheURLStops(t *testing.T) {
 	defer sa.Close()
 	defer sb.Close()
 
-	got := fetchWithMirrors(t, sa.URL+"/mirror.data", sb.URL+"/mirror.data")
+	got := fetchWithMirrors(t, 6, sa.URL+"/mirror.data", sb.URL+"/mirror.data")
 	if !bytes.Equal(got, data) {
 		t.Fatal("the file differs from the source")
 	}
@@ -137,8 +137,53 @@ func TestFetcher_MirrorSendingTheWholeFileIsRefused(t *testing.T) {
 	defer sa.Close()
 	defer sb.Close()
 
-	got := fetchWithMirrors(t, sa.URL+"/mirror.data", sb.URL+"/mirror.data")
+	got := fetchWithMirrors(t, 6, sa.URL+"/mirror.data", sb.URL+"/mirror.data")
 	if !bytes.Equal(got, data) {
 		t.Fatal("the file differs from the source")
+	}
+}
+
+// slowWriter paces a response, so the requests a source answers overlap.
+type slowWriter struct{ gohttp.ResponseWriter }
+
+func (w slowWriter) Write(p []byte) (int, error) {
+	time.Sleep(time.Millisecond)
+	return w.ResponseWriter.Write(p)
+}
+
+// A hoster may count an account's connections, so the share a source was
+// given is all it gets, also when the other sources die.
+func TestFetcher_DeadMirrorsLeaveTheURLItsShareOfConnections(t *testing.T) {
+	data := randomData(t, 8<<20)
+	var refused atomic.Bool
+	var inFlight, peak atomic.Int32
+	primary := gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		if r.Header.Get("Range") != "" && refused.Load() {
+			n := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+			}
+		}
+		gohttp.ServeContent(slowWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
+	})
+	gone := gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		refused.Store(true)
+		w.WriteHeader(gohttp.StatusGone)
+	})
+	sa := httptest.NewServer(primary)
+	defer sa.Close()
+	var mirrors []string
+	for range 3 {
+		s := httptest.NewServer(gone)
+		defer s.Close()
+		mirrors = append(mirrors, s.URL+"/mirror.data")
+	}
+
+	got := fetchWithMirrors(t, 4, sa.URL+"/mirror.data", mirrors...)
+	if !bytes.Equal(got, data) {
+		t.Fatal("the file differs from the source")
+	}
+	if p := peak.Load(); p > 1 {
+		t.Fatalf("the URL served %d ranges at once, want its share of 1", p)
 	}
 }

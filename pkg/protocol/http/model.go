@@ -5,8 +5,9 @@ type ReqExtra struct {
 	Header map[string]string `json:"header"`
 	Body   string            `json:"body"`
 	// Mirrors are further URLs serving the same file. A ranged download
-	// spreads its connections over the URL and its mirrors, and moves a
-	// connection on when its source refuses it or keeps failing. Each mirror
+	// spreads its connections evenly over the URL and its mirrors, and moves
+	// a connection on when its source refuses it or keeps failing. No source
+	// holds more than its even share, even when the others die. Each mirror
 	// gets the same method, headers and body as the URL, and must answer a
 	// range request with 206.
 	Mirrors []string `json:"mirrors"`
