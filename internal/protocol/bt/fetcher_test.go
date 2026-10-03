@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -637,4 +638,41 @@ func TestClosingTheClientFreesTheTrackerSockets(t *testing.T) {
 		t.Fatalf("port %d of the tracker socket is still taken after the client closed: %v", port, err)
 	}
 	pc.Close()
+}
+
+func TestAMagnetGivenUpOnWhileItWaitsForItsFilesLeavesTheClient(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeClient() })
+	f := buildConfigFetcherWith(config{DisableDHT: true}).(*Fetcher)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- f.ResolveContext(ctx, &base.Request{URL: "magnet:?xt=urn:btih:" + strings.Repeat("ab", 20)}, nil)
+	}()
+	for deadline := time.Now().Add(5 * time.Second); !inClient(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the magnet never reached the client")
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ResolveContext() got = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ResolveContext() still waits for the file list after its context ended")
+	}
+	if inClient() {
+		t.Error("the magnet stayed in the client")
+	}
+}
+
+// inClient reports whether the client holds a torrent.
+func inClient() bool {
+	lock.Lock()
+	defer lock.Unlock()
+	return client != nil && len(client.Torrents()) > 0
 }

@@ -160,12 +160,18 @@ func (f *Fetcher) initClient() (err error) {
 }
 
 func (f *Fetcher) Resolve(req *base.Request, opts *base.Options) error {
+	return f.ResolveContext(context.Background(), req, opts)
+}
+
+// ResolveContext closes the fetcher, which drops its torrent, when ctx ends
+// before the torrent's file list has arrived.
+func (f *Fetcher) ResolveContext(ctx context.Context, req *base.Request, opts *base.Options) error {
 	f.meta.Req = req
 	f.meta.Opts = opts
 	if f.meta.Opts == nil {
 		f.meta.Opts = &base.Options{}
 	}
-	if err := f.addTorrent(req, false); err != nil {
+	if err := f.addTorrent(ctx, req, false); err != nil {
 		return err
 	}
 	f.updateRes()
@@ -174,7 +180,7 @@ func (f *Fetcher) Resolve(req *base.Request, opts *base.Options) error {
 
 func (f *Fetcher) Start() (err error) {
 	if !f.torrentReady.Load() {
-		if err = f.addTorrent(f.meta.Req, false); err != nil {
+		if err = f.addTorrent(context.Background(), f.meta.Req, false); err != nil {
 			return
 		}
 	}
@@ -381,7 +387,7 @@ func (f *Fetcher) updateRes() {
 }
 
 func (f *Fetcher) Upload() (err error) {
-	return f.addTorrent(f.meta.Req, true)
+	return f.addTorrent(context.Background(), f.meta.Req, true)
 }
 
 func (f *Fetcher) doUpload(fromUpload bool) {
@@ -461,7 +467,7 @@ func (f *Fetcher) WaitUpload() (err error) {
 	return nil
 }
 
-func (f *Fetcher) addTorrent(req *base.Request, fromUpload bool) (err error) {
+func (f *Fetcher) addTorrent(ctx context.Context, req *base.Request, fromUpload bool) (err error) {
 	// anacrolix/torrent panics on input it takes for impossible, and Start
 	// and Upload call this on the downloader's own goroutines, where a panic
 	// ends the process.
@@ -551,7 +557,12 @@ func (f *Fetcher) addTorrent(req *base.Request, fromUpload bool) (err error) {
 			f.torrent.AddTrackers(announceList)
 		}
 	}
-	<-f.torrent.GotInfo()
+	select {
+	case <-f.torrent.GotInfo():
+	case <-ctx.Done():
+		f.Close()
+		return ctx.Err()
+	}
 	f.torrentReady.Store(true)
 
 	go f.doUpload(fromUpload)

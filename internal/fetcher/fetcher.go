@@ -1,6 +1,7 @@
 package fetcher
 
 import (
+	"context"
 	"path"
 	"strings"
 
@@ -29,6 +30,14 @@ type Fetcher interface {
 	Progress() Progress
 	// Wait for the download to complete, this method will block until the download is done.
 	Wait() error
+}
+
+// ContextResolver is an optional extension for fetchers whose Resolve can wait
+// a long time, such as a magnet waiting for its file list.
+type ContextResolver interface {
+	// ResolveContext is Resolve that gives up once ctx ends and lets go of
+	// what it holds.
+	ResolveContext(ctx context.Context, req *base.Request, opts *base.Options) error
 }
 
 type Uploader interface {
