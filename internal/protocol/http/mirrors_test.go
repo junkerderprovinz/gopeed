@@ -245,7 +245,7 @@ func TestFetcher_ConnectionWaitingForASourceLeavesItsChunkToTheOthers(t *testing
 	ctx, cancel := context.WithCancel(context.Background())
 	waiter.ctx = ctx
 	done := make(chan bool)
-	go func() { done <- f.takeSource(waiter) }()
+	go func() { done <- f.takeSource(waiter, nil) }()
 	for waiting := false; !waiting; {
 		time.Sleep(time.Millisecond)
 		f.connMu.Lock()
@@ -260,5 +260,81 @@ func TestFetcher_ConnectionWaitingForASourceLeavesItsChunkToTheOthers(t *testing
 	}
 	if !helped {
 		t.Fatal("the chunk of the waiting connection was not shared out")
+	}
+}
+
+// A 403 is more often a cap on connections than the end of a source, so the
+// URL stays in use. The connections it turns away wait for a place on a
+// mirror instead of leaving their part of the file undone.
+func TestFetcher_URLForbiddingRangesLeavesItsShareToTheMirrors(t *testing.T) {
+	data := randomData(t, 32<<20)
+	primary := gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		if r.Header.Get("Range") != "" {
+			w.WriteHeader(gohttp.StatusForbidden)
+			return
+		}
+		gohttp.ServeContent(slowWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
+	})
+	sa := httptest.NewServer(primary)
+	defer sa.Close()
+	var mirrors []string
+	for range 2 {
+		c := &source{data: data}
+		s := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+			c.ServeHTTP(slowWriter{w}, r)
+		}))
+		defer s.Close()
+		mirrors = append(mirrors, s.URL+"/mirror.data")
+	}
+
+	got := fetchWithMirrors(t, 12, sa.URL+"/mirror.data", mirrors...)
+	if !bytes.Equal(got, data) {
+		t.Fatal("the file differs from the source")
+	}
+}
+
+func TestFetcher_EverySourceForbiddingRangesEndsTheDownload(t *testing.T) {
+	data := randomData(t, 8<<20)
+	var refused atomic.Int32
+	forbid := gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		if r.Header.Get("Range") != "" {
+			refused.Add(1)
+			w.WriteHeader(gohttp.StatusForbidden)
+			return
+		}
+		gohttp.ServeContent(slowWriter{w}, r, "mirror.data", time.Time{}, bytes.NewReader(data))
+	})
+	var urls []string
+	for range 3 {
+		s := httptest.NewServer(forbid)
+		defer s.Close()
+		urls = append(urls, s.URL+"/mirror.data")
+	}
+
+	f := buildFetcher()
+	err := f.Resolve(&base.Request{
+		URL:   urls[0],
+		Extra: &http.ReqExtra{Mirrors: urls[1:]},
+	}, &base.Options{
+		Name:  "mirror.data",
+		Path:  t.TempDir(),
+		Extra: &http.OptsExtra{Connections: 4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- f.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		f.Pause()
+		t.Fatalf("the download still ran after %d refused ranges", refused.Load())
+	}
+	if n := refused.Load(); n > 3 {
+		t.Fatalf("the sources refused %d ranges, want one each", n)
 	}
 }

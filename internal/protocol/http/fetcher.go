@@ -868,7 +868,7 @@ func (f *Fetcher) expandConnections() {
 		connID := len(f.connections)
 		source := 0
 		if n := f.sourceCount(); n > 1 {
-			if source = f.openSourceLocked(connID%n, -1); source < 0 {
+			if source = f.openSourceLocked(connID%n, nil); source < 0 {
 				break
 			}
 		}
@@ -931,6 +931,8 @@ func (f *Fetcher) runConnection(conn *connection) {
 	// stuck counts the failures in a row that brought no bytes, which is
 	// what decides when a source with mirrors beside it is given up.
 	stuck := 0
+	// refused holds the sources that answered 403 since the last bytes.
+	var refused map[int]bool
 
 	for {
 		// Rebuild client with updated fast-fail timeout on retries
@@ -938,13 +940,14 @@ func (f *Fetcher) runConnection(conn *connection) {
 			client = f.buildFastFailClient()
 		}
 
-		if !f.takeSource(conn) {
+		if !f.takeSource(conn, refused) {
 			return
 		}
 		before := conn.Downloaded
 		err := f.downloadChunkOnce(conn, client, buf)
 		if conn.Downloaded > before {
 			stuck = 0
+			refused = nil
 		}
 		if err == nil {
 			if !f.meta.Res.Range || !f.helpOtherConnection(conn) {
@@ -975,8 +978,15 @@ func (f *Fetcher) runConnection(conn *connection) {
 		if shouldCountHTTPFailure(err) {
 			if re := extractRequestError(err); re != nil && re.Code == 403 {
 				// A 403 is often a cap on connections rather than the end of
-				// the source, so the source stays in use for the others.
-				if f.switchSource(conn, false) {
+				// the source, so the source stays in use for the others, and
+				// the connection goes on with the sources that have not
+				// refused it.
+				if f.sourceCount() > 1 {
+					if refused == nil {
+						refused = map[int]bool{}
+					}
+					refused[conn.source] = true
+					conn.retryTimes = 0
 					retries, stuck = 0, 0
 					continue
 				}
@@ -997,7 +1007,7 @@ func (f *Fetcher) runConnection(conn *connection) {
 			// start batch open, or the batch would end the expansion while
 			// the connection may still get going on another source.
 			if conn.retryTimes >= 3 {
-				if f.switchSource(conn, true) {
+				if f.dropSource(conn) {
 					retries, stuck = 0, 0
 					continue
 				}
@@ -1009,7 +1019,7 @@ func (f *Fetcher) runConnection(conn *connection) {
 				}
 				return
 			}
-		} else if stuck >= 3 && f.switchSource(conn, true) {
+		} else if stuck >= 3 && f.dropSource(conn) {
 			retries, stuck = 0, 0
 			continue
 		}
@@ -1044,14 +1054,14 @@ func (f *Fetcher) sourceShare(n int) int {
 }
 
 // openSourceLocked is the first source from from on that is still in use, is
-// not skip and holds less than its share, or -1 when there is none. Caller
+// not in skip and holds less than its share, or -1 when there is none. Caller
 // holds connMu.
-func (f *Fetcher) openSourceLocked(from, skip int) int {
+func (f *Fetcher) openSourceLocked(from int, skip map[int]bool) int {
 	n := f.sourceCount()
 	share := f.sourceShare(n)
 	for i := range n {
 		s := (from + i) % n
-		if s != skip && !f.deadSources[s] && f.sourceLoad[s] < share {
+		if !skip[s] && !f.deadSources[s] && f.sourceLoad[s] < share {
 			return s
 		}
 	}
@@ -1082,22 +1092,38 @@ func (f *Fetcher) releaseSourceLocked(conn *connection) {
 	}
 }
 
-// takeSource makes sure conn holds a place on a source still in use, and
-// waits while every such source is at its share. It reports false when the
-// connection is stopped first.
-func (f *Fetcher) takeSource(conn *connection) bool {
+// takeSource makes sure conn holds a place on a source still in use that has
+// not refused it, and waits while every such source is at its share. It
+// reports false when the connection is stopped first, or when every source
+// still in use has refused it, which fails the connection.
+func (f *Fetcher) takeSource(conn *connection, refused map[int]bool) bool {
 	for {
 		f.connMu.Lock()
-		if f.sourceCount() == 1 || (conn.claimed && !f.deadSources[conn.source]) {
+		if f.sourceCount() == 1 || (conn.claimed && !f.deadSources[conn.source] && !refused[conn.source]) {
 			f.connMu.Unlock()
 			return true
 		}
-		if s := f.openSourceLocked(conn.source, -1); s >= 0 {
+		if s := f.openSourceLocked(conn.source, refused); s >= 0 {
 			f.holdSourceLocked(conn, s)
 			f.connMu.Unlock()
 			return true
 		}
 		f.releaseSourceLocked(conn)
+		left := false
+		for s := range f.sourceCount() {
+			if !f.deadSources[s] && !refused[s] {
+				left = true
+			}
+		}
+		if !left {
+			conn.State = connFailed
+			conn.failed = true
+			f.connMu.Unlock()
+			if f.slowStart != nil {
+				f.slowStart.onConnectFailed()
+			}
+			return false
+		}
 		// The others take work from a chunk whose connection has not failed
 		// and whose speed is unknown.
 		conn.State = connConnecting
@@ -1115,24 +1141,13 @@ func (f *Fetcher) takeSource(conn *connection) bool {
 	}
 }
 
-// switchSource moves conn off its source. With drop the source is given up
-// and conn takes or waits for a place on another in takeSource. Without it
-// the source stays in use, and conn moves only to a source with room. It
-// reports false when conn stays where it is.
-func (f *Fetcher) switchSource(conn *connection, drop bool) bool {
+// dropSource gives up conn's source, and conn takes or waits for a place on
+// another in takeSource. It reports false when no other source is left, and
+// conn stays where it is.
+func (f *Fetcher) dropSource(conn *connection) bool {
 	n := f.sourceCount()
 	f.connMu.Lock()
 	defer f.connMu.Unlock()
-	if !drop {
-		s := f.openSourceLocked(conn.source+1, conn.source)
-		if s < 0 {
-			return false
-		}
-		f.holdSourceLocked(conn, s)
-		conn.retryTimes = 0
-		conn.failed = false
-		return true
-	}
 	for i := 1; i < n; i++ {
 		s := (conn.source + i) % n
 		if f.deadSources[s] {
