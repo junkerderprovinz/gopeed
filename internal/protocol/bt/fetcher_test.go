@@ -1,6 +1,7 @@
 package bt
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -13,7 +14,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +26,8 @@ import (
 	"github.com/GopeedLab/gopeed/pkg/base"
 	"github.com/GopeedLab/gopeed/pkg/netbind"
 	"github.com/GopeedLab/gopeed/pkg/protocol/bt"
+	"github.com/anacrolix/torrent/tracker"
+	"github.com/anacrolix/torrent/tracker/udp"
 	"golang.org/x/time/rate"
 )
 
@@ -700,5 +705,82 @@ func TestTheClientLeavesTheWorkingDirectoryAlone(t *testing.T) {
 	}
 	for _, e := range entries {
 		t.Errorf("the client left %s in the working directory", e.Name())
+	}
+}
+
+// udpEventTracker is a UDP tracker that keeps the events of the announces it
+// is sent and asks for one every second.
+func udpEventTracker(t *testing.T) (string, func() []tracker.AnnounceEvent) {
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	var mu sync.Mutex
+	var events []tracker.AnnounceEvent
+	go func() {
+		b := make([]byte, 0x10000)
+		for {
+			n, addr, err := pc.ReadFrom(b)
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			r := bytes.NewReader(b[:n])
+			var h udp.RequestHeader
+			if err != nil || udp.Read(r, &h) != nil {
+				continue
+			}
+			var resp bytes.Buffer
+			udp.Write(&resp, udp.ResponseHeader{Action: h.Action, TransactionId: h.TransactionId})
+			switch h.Action {
+			case udp.ActionConnect:
+				udp.Write(&resp, udp.ConnectionResponse{ConnectionId: 1})
+			case udp.ActionAnnounce:
+				var req udp.AnnounceRequest
+				if udp.Read(r, &req) != nil {
+					continue
+				}
+				mu.Lock()
+				events = append(events, req.Event)
+				mu.Unlock()
+				udp.Write(&resp, udp.AnnounceResponseHeader{Interval: 1})
+			default:
+				continue
+			}
+			pc.WriteTo(resp.Bytes(), addr)
+		}
+	}()
+	return "udp://" + pc.LocalAddr().String() + "/announce", func() []tracker.AnnounceEvent {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(events)
+	}
+}
+
+func TestClosingTheLastTorrentTellsItsUDPTrackerItStopped(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeClient() })
+	url, events := udpEventTracker(t)
+	f := buildFetcher()
+	err := f.Resolve(&base.Request{
+		URL:   "./testdata/test.torrent",
+		Extra: bt.ReqExtra{Trackers: []string{url}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second announce means the answer to the first one has been taken in.
+	for deadline := time.Now().Add(10 * time.Second); len(events()) < 2; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the tracker got %v, want two announces", events())
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := events(); !slices.Contains(got, tracker.Stopped) {
+		t.Errorf("the tracker got %v, want a stopped once the client closed", got)
 	}
 }
