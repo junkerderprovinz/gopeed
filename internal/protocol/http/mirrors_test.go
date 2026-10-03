@@ -2,6 +2,7 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	gohttp "net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GopeedLab/gopeed/internal/fetcher"
 	"github.com/GopeedLab/gopeed/pkg/base"
 	"github.com/GopeedLab/gopeed/pkg/protocol/http"
 )
@@ -221,5 +223,42 @@ func TestFetcher_URLRefusingRangesLeavesTheDownloadToAllMirrors(t *testing.T) {
 		if c.ranged.Load() == 0 {
 			t.Fatalf("mirror %d was never asked for a range", i+1)
 		}
+	}
+}
+
+func TestFetcher_ConnectionWaitingForASourceLeavesItsChunkToTheOthers(t *testing.T) {
+	f := &Fetcher{meta: &fetcher.FetcherMeta{
+		Req:  &base.Request{Extra: &http.ReqExtra{Mirrors: []string{"mirror"}}},
+		Opts: &base.Options{Extra: &http.OptsExtra{Connections: 2}},
+		Res:  &base.Resource{Range: true},
+	}}
+	helper := &connection{ID: 0, State: connDownloading, Chunk: newChunk(0, 1<<20-1)}
+	helper.Chunk.Downloaded = 1 << 20
+	// The mirror died, so the waiter is left with the URL, which holds its
+	// share of one already. runConnection leaves it marked failed from the
+	// retries on the mirror.
+	waiter := &connection{ID: 1, State: connFailed, Chunk: newChunk(1<<20, 9<<20-1), source: 1, speed: 1 << 30}
+	f.connections = []*connection{helper, waiter}
+	f.deadSources = map[int]bool{1: true}
+	f.holdSourceLocked(helper, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waiter.ctx = ctx
+	done := make(chan bool)
+	go func() { done <- f.takeSource(waiter) }()
+	for waiting := false; !waiting; {
+		time.Sleep(time.Millisecond)
+		f.connMu.Lock()
+		waiting = f.sourceFreed != nil
+		f.connMu.Unlock()
+	}
+
+	helped := f.helpOtherConnection(helper)
+	cancel()
+	if <-done {
+		t.Fatal("the waiter got a place on a source that was full")
+	}
+	if !helped {
+		t.Fatal("the chunk of the waiting connection was not shared out")
 	}
 }

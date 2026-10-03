@@ -1098,7 +1098,9 @@ func (f *Fetcher) takeSource(conn *connection) bool {
 			return true
 		}
 		f.releaseSourceLocked(conn)
-		// Unknown speed marks its chunk as one the others take work from.
+		// The others take work from a chunk whose connection has not failed
+		// and whose speed is unknown.
+		conn.State = connConnecting
 		conn.speed = 0
 		if f.sourceFreed == nil {
 			f.sourceFreed = make(chan struct{})
