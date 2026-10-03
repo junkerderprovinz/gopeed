@@ -676,3 +676,29 @@ func inClient() bool {
 	defer lock.Unlock()
 	return client != nil && len(client.Torrents()) > 0
 }
+
+func TestTheClientLeavesTheWorkingDirectoryAlone(t *testing.T) {
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	t.Chdir(dir)
+	f := buildFetcher().(*Fetcher)
+	f.meta.Req = &base.Request{}
+	lock.Lock()
+	err := f.initClient()
+	lock.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closeClient(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		t.Errorf("the client left %s in the working directory", e.Name())
+	}
+}

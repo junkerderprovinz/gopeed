@@ -84,6 +84,10 @@ func (f *Fetcher) initClient() (err error) {
 	cfg.NoDHT = f.config.DisableDHT
 	cfg.DisablePEX = f.config.DisablePEX
 	cfg.UploadRateLimiter = uploadLimiter
+	// Every torrent gets storage of its own (see addTorrentSpec). The client's
+	// default would open a piece completion database in the working directory,
+	// which is often not writable.
+	cfg.DefaultStorage = storage.NewFileOpts(storage.NewFileClientOpts{ClientBaseDir: cfg.DataDir})
 
 	// Every socket comes from the binder, so binding to an interface or
 	// leaving it applies to running torrents too. UPnP talks to the router
