@@ -354,6 +354,32 @@ func TestFetcher_DownloadChunked(t *testing.T) {
 	downloadNormal(listener, 2, t)
 }
 
+func TestFetcher_StoreWhileStarting(t *testing.T) {
+	listener := test.StartTestNoRangeSlowServer(time.Millisecond)
+	defer listener.Close()
+
+	fm := new(FetcherManager)
+	f := downloadReady(listener, 4, t)
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- f.Wait() }()
+	for {
+		if _, err := fm.Store(f); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+			return
+		default:
+		}
+	}
+}
+
 func TestFetcher_DownloadPost(t *testing.T) {
 	listener := test.StartTestPostServer()
 	defer listener.Close()

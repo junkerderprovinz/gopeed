@@ -13,6 +13,7 @@ This branch is the gopeed that [KnightLoader](https://github.com/junkerderprovin
 - `Downloader.ResolveContext`: a resolve the caller can give up on. Once its context ends, a magnet still waiting for its file list leaves the BitTorrent client, and so does a resolved torrent that `Create` never took.
 - The BitTorrent client gives its default storage an in-memory piece completion. The default would open a database in the working directory, and no torrent uses the default storage.
 - Fixes to anacrolix/torrent, taken from a fork of it (see below), for the announces of a dropped torrent and of a closing client.
+- Locking for an HTTP download's connection list, which saving the task reads while the download loop adds to it.
 
 KnightLoader pins the branch with a `replace` directive in its `go.mod` that points at a commit here. Because this is the fork's default branch, Renovate in KnightLoader proposes the new head whenever the branch moves.
 
