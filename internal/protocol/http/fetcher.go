@@ -750,7 +750,9 @@ func (f *Fetcher) startResolveDownload() {
 			Chunk: newChunk(0, 0), // For non-range, end doesn't matter
 		}
 		conn.ctx, conn.cancel = context.WithCancel(f.ctx)
+		f.connMu.Lock()
 		f.connections = append(f.connections, conn)
+		f.connMu.Unlock()
 
 		f.wg.Add(1)
 		// Use the resolve response directly
