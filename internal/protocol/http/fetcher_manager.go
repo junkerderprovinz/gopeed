@@ -3,6 +3,7 @@ package http
 import (
 	"net/url"
 	"path"
+	"slices"
 
 	"github.com/GopeedLab/gopeed/internal/fetcher"
 	"github.com/GopeedLab/gopeed/pkg/base"
@@ -75,8 +76,12 @@ func (fm *FetcherManager) Store(f fetcher.Fetcher) (data any, err error) {
 	_f.redirectLock.Lock()
 	redirectURL := _f.redirectURL
 	_f.redirectLock.Unlock()
+	// The download loop appends to connections while the task is saved.
+	_f.connMu.Lock()
+	connections := slices.Clone(_f.connections)
+	_f.connMu.Unlock()
 	return &fetcherData{
-		Connections: _f.connections,
+		Connections: connections,
 		RedirectURL: redirectURL,
 	}, nil
 }
