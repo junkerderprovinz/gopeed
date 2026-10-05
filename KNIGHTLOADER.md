@@ -14,6 +14,7 @@ This branch is the gopeed that [KnightLoader](https://github.com/junkerderprovin
 - The BitTorrent client gives its default storage an in-memory piece completion. The default would open a database in the working directory, and no torrent uses the default storage.
 - Fixes to anacrolix/torrent, taken from a fork of it (see below), for the announces of a dropped torrent and of a closing client.
 - Locking for an HTTP download's connection list, which saving the task reads while the download loop adds to it.
+- An HTTP download restored from a saved task starts at once. Upstream first waits ten seconds for a prefetch that only a fresh resolve starts.
 
 KnightLoader pins the branch with a `replace` directive in its `go.mod` that points at a commit here. Because this is the fork's default branch, Renovate in KnightLoader proposes the new head whenever the branch moves.
 

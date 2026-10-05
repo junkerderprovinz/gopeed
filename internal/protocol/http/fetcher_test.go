@@ -499,6 +499,43 @@ func TestFetcher_DownloadResume(t *testing.T) {
 	downloadResume(listener, 16, t)
 }
 
+// A fetcher restored from a saved task never prefetched, so its start has
+// nothing to wait for.
+func TestFetcher_RestoredStartsWithoutWaitingForPrefetch(t *testing.T) {
+	listener := test.StartTestFileServer()
+	defer listener.Close()
+	first := downloadReady(listener, 4, t)
+	if err := first.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	first.Pause()
+	paused := first.Progress()[0]
+	if paused >= test.BuildSize {
+		t.Fatal("the download finished before it was paused")
+	}
+	fm := new(FetcherManager)
+	data, err := fm.Store(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, restore := fm.Restore()
+	restored := restore(first.Meta(), data).(*Fetcher)
+	restored.Setup(buildFetcher().ctl)
+	deadline := time.Now().Add(5 * time.Second)
+	if err := restored.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Pause()
+	for restored.Progress()[0] <= paused {
+		if time.Now().After(deadline) {
+			t.Fatal("the restored download fetched nothing within 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestFetcher_DownloadWithProxy(t *testing.T) {
 	httpListener := test.StartTestFileServer()
 	defer httpListener.Close()
