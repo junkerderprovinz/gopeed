@@ -164,4 +164,4 @@ require (
 )
 
 // Fixes to anacrolix/torrent that upstream does not have yet, see KNIGHTLOADER.md.
-replace github.com/anacrolix/torrent => github.com/junkerderprovinz/torrent v1.61.1-0.20261003180733-174c1310bcc0
+replace github.com/anacrolix/torrent => ../torrent-vpn
