@@ -109,7 +109,12 @@ func (f *Fetcher) initClient() (err error) {
 		}
 		return proxy(r)
 	}
+	// Names resolve where the sockets go, so a tunnel's traffic does not
+	// announce its trackers to the system's name servers.
 	dnsResolver := &DnsCacheResolver{RefreshTimeout: 5 * time.Minute, Dial: binder.DialContext}
+	dnsResolver.resolver.Resolver = binder
+	cfg.TrackerLookupHost = binder.LookupHost
+	cfg.DhtStartingNodes = dhtStartingNodes
 	cfg.TrackerDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if !binder.State().Up {
 			return nil, netbind.ErrDown
@@ -130,7 +135,11 @@ func (f *Fetcher) initClient() (err error) {
 		if err != nil {
 			return nil, err
 		}
-		return binder.PacketConn(network, p)
+		pc, err := binder.PacketConn(network, p)
+		if err == nil {
+			peerPackets = append(peerPackets, pc)
+		}
+		return pc, err
 	}
 	// The client's own TCP sockets cannot move to another address, so it
 	// gets the binder's instead.
@@ -720,10 +729,10 @@ func (fm *FetcherManager) Close() error {
 	return closeClient()
 }
 
-// ApplyConfig sets the upload limit and the network interface on running torrents.
-// Port, DHT and PEX are fixed when the client is built, and so are UPnP, WebRTC and
-// the address families, which follow the interface; an idle client is closed and
-// rebuilt by the next task.
+// ApplyConfig sets the upload limit, the network interface and the listening port
+// on running torrents. DHT and PEX are fixed when the client is built, and so are
+// UPnP, WebRTC and the address families, which follow the interface; an idle client
+// is closed and rebuilt by the next task.
 func (fm *FetcherManager) ApplyConfig(getConfig func(v any)) {
 	var c config
 	getConfig(&c)
@@ -743,6 +752,9 @@ func (fm *FetcherManager) ApplyConfig(getConfig func(v any)) {
 	}
 	binder.SetInterface(c.Interface)
 	if len(client.Torrents()) > 0 {
+		if c.ListenPort != 0 && cfg.ListenPort != c.ListenPort {
+			movePeerPort(c.ListenPort)
+		}
 		return
 	}
 	if (c.ListenPort != 0 && cfg.ListenPort != c.ListenPort) || cfg.NoDHT != c.DisableDHT || cfg.DisablePEX != c.DisablePEX ||

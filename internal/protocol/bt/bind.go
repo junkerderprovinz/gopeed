@@ -1,11 +1,17 @@
 package bt
 
 import (
+	"context"
+	"errors"
 	"net"
+	"net/netip"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/GopeedLab/gopeed/pkg/netbind"
+	"github.com/anacrolix/dht/v2"
 	"github.com/anacrolix/torrent"
 )
 
@@ -79,6 +85,7 @@ func closePeerListeners() {
 		l.Close()
 	}
 	peerListeners = nil
+	peerPackets = nil
 }
 
 // While the interface is down every dial fails, and the client forgets a peer
@@ -120,5 +127,83 @@ func restoreSwarms(st netbind.State) {
 	swarmLock.Unlock()
 	for t, peers := range saved {
 		t.AddPeers(peers)
+	}
+}
+
+// peerPackets are the client's UDP sockets for uTP and the DHT, guarded by
+// lock like client. The client closes them itself.
+var peerPackets []net.PacketConn
+
+// movePeerPort moves the client's peer sockets to port while torrents run, so
+// a port a VPN forwards takes effect without dropping a download, and has
+// every torrent tell its trackers and the DHT. The client announces whatever
+// port its listeners report, so nothing else needs to learn it. A socket that
+// cannot move takes the others back, so the client never listens on two
+// ports. It must be called with lock held.
+func movePeerPort(port int) error {
+	old := cfg.ListenPort
+	sockets := make([]any, 0, len(peerListeners)+len(peerPackets))
+	for _, l := range peerListeners {
+		sockets = append(sockets, l.Listener)
+	}
+	for _, pc := range peerPackets {
+		sockets = append(sockets, pc)
+	}
+	for i, s := range sockets {
+		if err := netbind.SetPort(s, port); err != nil {
+			for _, moved := range sockets[:i] {
+				netbind.SetPort(moved, old)
+			}
+			return err
+		}
+	}
+	cfg.ListenPort = port
+	client.ReannounceToTrackers()
+	for _, t := range client.Torrents() {
+		for _, s := range client.DhtServers() {
+			if done, stop, err := t.AnnounceToDht(s); err == nil {
+				go func() {
+					select {
+					case <-done:
+					case <-time.After(time.Minute):
+					}
+					stop()
+				}()
+			}
+		}
+	}
+	return nil
+}
+
+// dhtStartingNodes resolves the DHT's bootstrap nodes with the binder, like
+// every other name the client looks up.
+func dhtStartingNodes(string) dht.StartingNodesGetter {
+	return func() ([]dht.Addr, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		var addrs []dht.Addr
+		for _, hp := range dht.DefaultGlobalBootstrapHostPorts {
+			host, port, err := net.SplitHostPort(hp)
+			if err != nil {
+				continue
+			}
+			p, err := strconv.Atoi(port)
+			if err != nil {
+				continue
+			}
+			ips, err := binder.LookupHost(ctx, host)
+			if err != nil {
+				continue
+			}
+			for _, ip := range ips {
+				if a, err := netip.ParseAddr(ip); err == nil {
+					addrs = append(addrs, dht.NewAddr(net.UDPAddrFromAddrPort(netip.AddrPortFrom(a.Unmap(), uint16(p)))))
+				}
+			}
+		}
+		if len(addrs) == 0 {
+			return nil, errors.New("no DHT bootstrap node resolved")
+		}
+		return addrs, nil
 	}
 }

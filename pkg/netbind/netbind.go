@@ -42,27 +42,31 @@ type Interface struct {
 }
 
 // Interfaces lists the system's interfaces with the addresses a Binder would
-// bind to on each.
+// bind to on each, followed by the registered networks.
 func Interfaces() ([]Interface, error) {
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Interface, 0, len(ifs))
+	nets := registeredInterfaces()
+	out := make([]Interface, 0, len(ifs)+len(nets))
 	for _, ifc := range ifs {
 		addrs, _ := ifc.Addrs()
 		l := linkOf(ifc, addrs)
 		out = append(out, Interface{Name: ifc.Name, Up: l.up, Addrs: l.addrs()})
 	}
-	return out, nil
+	return append(out, nets...), nil
 }
 
 // link is what a Binder binds to: the interface's index and one address of
-// each family. A missing family is the zero Addr.
+// each family. A missing family is the zero Addr. For a registered Network,
+// net is that network and stack the stack behind it.
 type link struct {
 	up     bool
 	index  int
 	v4, v6 netip.Addr
+	net    Network
+	stack  uint64
 }
 
 func (l link) addrs() []netip.Addr {
@@ -128,6 +132,9 @@ func linkOf(ifc net.Interface, addrs []net.Addr) link {
 }
 
 func lookupLink(name string) link {
+	if n := registered(name); n != nil {
+		return networkLink(n)
+	}
 	ifc, err := net.InterfaceByName(name)
 	if err != nil {
 		return link{}
@@ -177,8 +184,8 @@ func New() *Binder {
 	}
 }
 
-// SetInterface binds every socket to the named interface, or to any with an
-// empty name. Sockets already open move at once and connections already open
+// SetInterface binds every socket to the named interface or registered
+// Network, or to any interface with an empty name. Sockets already open move at once and connections already open
 // are closed. While a name is set, the interface is looked at every
 // PollInterval.
 func (b *Binder) SetInterface(name string) {

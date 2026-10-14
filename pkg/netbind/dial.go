@@ -59,6 +59,11 @@ func (d Dialer) dialFrom(ctx context.Context, nd *net.Dialer, name string, l lin
 	var ips []netip.Addr
 	if ip, err := netip.ParseAddr(host); err == nil {
 		ips = []netip.Addr{ip.Unmap()}
+	} else if l.net != nil {
+		// The system's resolver would ask past the network.
+		if ips, err = l.net.LookupNetIP(ctx, "ip", host); err != nil {
+			return nil, err
+		}
 	} else if ips, err = net.DefaultResolver.LookupNetIP(ctx, "ip", host); err != nil {
 		return nil, err
 	}
@@ -77,9 +82,15 @@ func (d Dialer) dialFrom(ctx context.Context, nd *net.Dialer, name string, l lin
 		if !local.IsValid() || n[len(n)-1:] != family {
 			continue
 		}
-		nd.LocalAddr = localAddr(n, local, 0)
-		nd.Control = bindControl(name, l, n)
-		c, dialErr := nd.DialContext(ctx, n, net.JoinHostPort(ip.String(), port))
+		var c net.Conn
+		var dialErr error
+		if l.net != nil {
+			c, dialErr = l.net.DialContext(ctx, n, net.JoinHostPort(ip.String(), port))
+		} else {
+			nd.LocalAddr = localAddr(n, local, 0)
+			nd.Control = bindControl(name, l, n)
+			c, dialErr = nd.DialContext(ctx, n, net.JoinHostPort(ip.String(), port))
+		}
 		if dialErr == nil {
 			return c, nil
 		}
@@ -91,6 +102,25 @@ func (d Dialer) dialFrom(ctx context.Context, nd *net.Dialer, name string, l lin
 // DialContext is a Dialer's with no options set.
 func (b *Binder) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	return Dialer{Binder: b}.DialContext(ctx, network, address)
+}
+
+func listen(name string, l link, network string, at netip.Addr, port int) (net.Listener, error) {
+	if l.net != nil {
+		return l.net.Listen(network, netip.AddrPortFrom(at, uint16(port)))
+	}
+	return listenConfig(name, l, network).Listen(context.Background(), network, netip.AddrPortFrom(at, uint16(port)).String())
+}
+
+// boundPort is the port of a socket's own address, whichever stack opened it.
+func boundPort(a net.Addr) int {
+	switch a := a.(type) {
+	case *net.TCPAddr:
+		return a.Port
+	case *net.UDPAddr:
+		return a.Port
+	}
+	ap, _ := netip.ParseAddrPort(a.String())
+	return int(ap.Port())
 }
 
 func portOf(address string) (int, error) {
@@ -114,5 +144,8 @@ func listenConfig(name string, l link, network string) *net.ListenConfig {
 }
 
 func listenPacket(name string, l link, network string, at netip.Addr, port int) (net.PacketConn, error) {
+	if l.net != nil {
+		return l.net.ListenPacket(network, netip.AddrPortFrom(at, uint16(port)))
+	}
 	return listenConfig(name, l, network).ListenPacket(context.Background(), network, netip.AddrPortFrom(at, uint16(port)).String())
 }

@@ -1,7 +1,7 @@
 package netbind
 
 import (
-	"context"
+	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -10,14 +10,25 @@ import (
 	"time"
 )
 
-// bound is what a following socket currently sits on: the system socket, nil
-// while there is nothing to bind to, and the address and interface it was
-// bound for.
+// bound is what a following socket currently sits on: the socket, nil while
+// there is nothing to bind to, and the address and interface or network stack
+// it was bound for.
 type bound[T interface{ Close() error }] struct {
 	inner T
 	open  bool
 	at    netip.Addr
 	index int
+	net   Network
+	stack uint64
+}
+
+func boundOn[T interface{ Close() error }](s T, at netip.Addr, l link) bound[T] {
+	return bound[T]{inner: s, open: true, at: at, index: l.index, net: l.net, stack: l.stack}
+}
+
+// on reports whether the socket is open at at on l.
+func (b bound[T]) on(at netip.Addr, l link) bool {
+	return b.open && b.at == at && b.index == l.index && b.net == l.net && b.stack == l.stack
 }
 
 // follower holds the state a following socket shares between its packet and
@@ -50,7 +61,7 @@ func (f *follower[T]) rebind(name string, l link) {
 	at := l.addr(name, f.network)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed || (f.cur.open && f.cur.at == at && f.cur.index == l.index) {
+	if f.closed || f.cur.on(at, l) {
 		return
 	}
 	if f.cur.open {
@@ -59,11 +70,50 @@ func (f *follower[T]) rebind(name string, l link) {
 	}
 	if at.IsValid() {
 		if s, port, err := f.listen(name, l, at, f.port); err == nil {
-			f.cur = bound[T]{inner: s, open: true, at: at, index: l.index}
+			f.cur = boundOn(s, at, l)
 			f.port = port
 		}
 	}
 	f.signal()
+}
+
+// setPort opens the socket on port before it closes the one on the old port,
+// so a port that cannot be had leaves the socket working. While there is
+// nothing to bind to, the next rebind takes the port.
+func (f *follower[T]) setPort(port int) error {
+	if port <= 0 || port > 65535 {
+		return fmt.Errorf("netbind: port %d is out of range", port)
+	}
+	name, l, _ := f.b.now()
+	at := l.addr(name, f.network)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return net.ErrClosed
+	}
+	if port == f.port && f.cur.on(at, l) {
+		return nil
+	}
+	if !at.IsValid() {
+		if f.cur.open {
+			f.cur.inner.Close()
+			f.cur = bound[T]{}
+			f.signal()
+		}
+		f.port = port
+		return nil
+	}
+	s, got, err := f.listen(name, l, at, port)
+	if err != nil {
+		return err
+	}
+	if f.cur.open {
+		f.cur.inner.Close()
+	}
+	f.cur = boundOn(s, at, l)
+	f.port = got
+	f.signal()
+	return nil
 }
 
 // current is the system socket, whether there is one, and the channel that
@@ -84,6 +134,23 @@ func (f *follower[T]) moved(inner T) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.closed || !f.cur.open || any(f.cur.inner) != any(inner)
+}
+
+// lost is moved for an error reading inner. A Network can close its stack
+// under a socket before the Binder has looked at it, so for a socket of a
+// Network the Binder looks again first.
+func (f *follower[T]) lost(inner T) bool {
+	if f.moved(inner) {
+		return true
+	}
+	f.mu.Lock()
+	onNetwork := f.cur.net != nil
+	f.mu.Unlock()
+	if !onNetwork {
+		return false
+	}
+	f.b.Refresh()
+	return f.moved(inner)
 }
 
 func (f *follower[T]) close() error {
@@ -115,7 +182,7 @@ func (f *follower[T]) start() error {
 	if at.IsValid() {
 		s, port, err := f.listen(name, l, at, f.port)
 		if err == nil {
-			f.cur = bound[T]{inner: s, open: true, at: at, index: l.index}
+			f.cur = boundOn(s, at, l)
 			f.port = port
 		} else if name == "" && !f.waits {
 			return err
@@ -194,7 +261,7 @@ func (b *Binder) packetConn(network string, port int, waits bool) (net.PacketCon
 		}
 		pc.SetReadDeadline(p.readDeadline)
 		pc.SetWriteDeadline(p.writeDeadline)
-		return pc, pc.LocalAddr().(*net.UDPAddr).Port, nil
+		return pc, boundPort(pc.LocalAddr()), nil
 	}
 	if err := p.start(); err != nil {
 		return nil, err
@@ -222,7 +289,7 @@ func (p *packetConn) ReadFrom(buf []byte) (int, net.Addr, error) {
 			continue
 		}
 		n, addr, err := inner.ReadFrom(buf)
-		if err != nil && p.moved(inner) {
+		if err != nil && p.lost(inner) {
 			continue
 		}
 		return n, addr, err
@@ -306,11 +373,11 @@ func (p *packetConn) SetWriteDeadline(t time.Time) error {
 func (b *Binder) Listener(network string, port int) (net.Listener, error) {
 	ln := &listener{follower: follower[net.Listener]{b: b, network: network, port: port}}
 	ln.listen = func(name string, l link, at netip.Addr, port int) (net.Listener, int, error) {
-		s, err := listenConfig(name, l, network).Listen(context.Background(), network, netip.AddrPortFrom(at, uint16(port)).String())
+		s, err := listen(name, l, network, at, port)
 		if err != nil {
 			return nil, 0, err
 		}
-		return s, s.Addr().(*net.TCPAddr).Port, nil
+		return s, boundPort(s.Addr()), nil
 	}
 	if err := ln.start(); err != nil {
 		return nil, err
@@ -335,7 +402,7 @@ func (ln *listener) Accept() (net.Conn, error) {
 		_, _, gen := ln.b.now()
 		c, err := inner.Accept()
 		if err != nil {
-			if ln.moved(inner) {
+			if ln.lost(inner) {
 				continue
 			}
 			return nil, err
