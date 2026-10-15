@@ -10,6 +10,9 @@ This branch is the gopeed that [KnightLoader](https://github.com/junkerderprovin
 - Mirror URLs for an HTTP download (`ReqExtra.Mirrors`). A ranged download spreads its connections over the URL and its mirrors, and moves a connection to another source when its own refuses it or keeps failing. No source holds more than its even share of the connections, so the connections of a dead source wait rather than crowd onto the others.
 - `Downloader.Stream`, which reads a file of a running task. A read waits for bytes that have not arrived, and the task fetches the part being read first: a torrent through a reader with readahead and both ends of the file raised, an HTTP download by moving one of its connections to the read position.
 - Binding BitTorrent traffic to one network interface (`pkg/netbind`): peers, trackers and the DHT use only that interface, and nothing is sent or received while it is missing or down. Tracker sockets open and wait in that state rather than fail, and a panic of anacrolix/torrent while a torrent is added becomes the task's error.
+- BitTorrent runs on an in-process network (`pkg/netbind`) instead of OS sockets, and the listening port can move while torrents run. Peers reconnect on the new port without the torrents being added again.
+- `Downloader.Discard` lets the caller wait until a discarded resolve is closed.
+- WebTorrent is off, because WebRTC would open sockets past the bound interface.
 - `Downloader.ResolveContext`: a resolve the caller can give up on. Once its context ends, a magnet still waiting for its file list leaves the BitTorrent client, and so does a resolved torrent that `Create` never took.
 - The BitTorrent client gives its default storage an in-memory piece completion. The default would open a database in the working directory, and no torrent uses the default storage.
 - Fixes to anacrolix/torrent, taken from a fork of it (see below), for the announces of a dropped torrent and of a closing client.
@@ -26,6 +29,8 @@ KnightLoader pins the branch with a `replace` directive in its `go.mod` that poi
 - If a torrent is dropped and added again before its stopped announce has gone out, upstream keeps the old announcer entry, which still points at the dropped torrent. It announces for that one until the garbage collector takes it, and then not at all. The fork hands the entry to the new torrent, which starts with a started announce.
 - Upstream's `Client.Close` never closes the tracker clients, so the socket of every UDP tracker stays open, and with an interface set the binder keeps moving these sockets along with it. The fork's `Close` sends the stopped announces of the torrents it drops, waits up to three seconds for them, and then closes the tracker clients. Nothing goes out after `Close` returns, so the binder can let go of the interface right away.
 - Upstream reads its map of tracker clients for an announce after releasing the client lock, while adding a tracker writes to that map under the lock. The fork looks the tracker client up before it lets go of the lock.
+- A torrent dropped while its started announce is still out gets a stopped announce afterwards, so the tracker does not keep listing it.
+- Trackers can be announced to on demand, and UDP trackers are resolved with a lookup the caller gives, so the name lookup also stays on the bound interface.
 
 KnightLoader carries the same `replace` in both of its `go.mod` files, since Go ignores a `replace` in a dependency. When gopeed moves to a newer anacrolix/torrent, rebase the fork's branch onto that version, push it, and point the `replace` here and in KnightLoader at the new commit. Drop the `replace` once upstream has these fixes.
 
