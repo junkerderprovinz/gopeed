@@ -96,7 +96,7 @@ type Downloader struct {
 	ExtensionLogger *logger.Logger
 
 	cfg          *DownloaderConfig
-	fetcherCache map[string]fetcher.Fetcher
+	fetcherCache map[string]*resolved
 	storage      Storage
 	tasks        []*Task
 	waitTasks    []*Task
@@ -123,7 +123,7 @@ func NewDownloader(cfg *DownloaderConfig) *Downloader {
 
 	d := &Downloader{
 		cfg:          cfg,
-		fetcherCache: make(map[string]fetcher.Fetcher),
+		fetcherCache: make(map[string]*resolved),
 		waitTasks:    make([]*Task, 0),
 		storage:      cfg.Storage,
 
@@ -443,17 +443,9 @@ func (d *Downloader) ResolveContext(ctx context.Context, req *base.Request, opts
 		return
 	}
 	d.fetcherMapLock.Lock()
-	d.fetcherCache[rrId] = f
+	d.fetcherCache[rrId] = &resolved{fetcher: f}
 	d.fetcherMapLock.Unlock()
-	context.AfterFunc(ctx, func() {
-		d.fetcherMapLock.Lock()
-		_, ok := d.fetcherCache[rrId]
-		delete(d.fetcherCache, rrId)
-		d.fetcherMapLock.Unlock()
-		if ok {
-			f.Close()
-		}
-	})
+	context.AfterFunc(ctx, func() { d.Discard(rrId) })
 	rr = &ResolveResult{
 		ID:  rrId,
 		Res: f.Meta().Res,
@@ -521,13 +513,43 @@ func (d *Downloader) CreateDirectBatch(req *base.CreateTaskBatch) (taskId []stri
 func (d *Downloader) Create(rrId string) (taskId string, err error) {
 	// Taken out at once, so a ResolveContext that ends meanwhile cannot close it.
 	d.fetcherMapLock.Lock()
-	fetcher, ok := d.fetcherCache[rrId]
-	delete(d.fetcherCache, rrId)
+	r, ok := d.fetcherCache[rrId]
+	ok = ok && !r.closing
+	if ok {
+		delete(d.fetcherCache, rrId)
+	}
 	d.fetcherMapLock.Unlock()
 	if !ok {
 		return "", errors.New("invalid resource id")
 	}
-	return d.doCreate(fetcher, nil)
+	return d.doCreate(r.fetcher, nil)
+}
+
+// resolved is a resolve result Create has not taken yet.
+type resolved struct {
+	fetcher fetcher.Fetcher
+	closing bool
+	close   sync.Once
+}
+
+// Discard closes the fetcher of a resolve result Create has not taken and
+// returns once it is closed, even when the end of the resolve's context started
+// the close. What the fetcher held, such as a torrent's open files, is free by
+// then. A created result is left alone.
+func (d *Downloader) Discard(rrId string) {
+	d.fetcherMapLock.Lock()
+	r, ok := d.fetcherCache[rrId]
+	if ok {
+		r.closing = true
+	}
+	d.fetcherMapLock.Unlock()
+	if !ok {
+		return
+	}
+	r.close.Do(func() { r.fetcher.Close() })
+	d.fetcherMapLock.Lock()
+	delete(d.fetcherCache, rrId)
+	d.fetcherMapLock.Unlock()
 }
 
 // Patch modifies task-specific data based on the protocol.
