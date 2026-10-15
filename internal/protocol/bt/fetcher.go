@@ -93,14 +93,15 @@ func (f *Fetcher) initClient() (err error) {
 
 	// Every socket comes from the binder, so binding to an interface or
 	// leaving it applies to running torrents too. UPnP talks to the router
-	// of the local network and WebRTC opens sockets of its own, so both stay
-	// off on a client built bound.
+	// of the local network, so it stays off on a client built bound. WebRTC
+	// opens sockets of its own that the binder never sees, and a client built
+	// unbound keeps them after it is bound, so it is never on.
 	binder.SetInterface(f.config.Interface)
 	builtFor = f.config.Interface
 	bound := f.config.Interface != ""
 	cfg.DisableIPv4, cfg.DisableIPv6 = familiesOff(binder.State())
 	cfg.NoDefaultPortForwarding = bound
-	cfg.DisableWebtorrent = bound
+	cfg.DisableWebtorrent = true
 	proxy := f.ctl.GetProxy(f.meta.Req.Proxy)
 	cfg.HTTPProxy = func(r *http.Request) (*url.URL, error) {
 		// A proxy would dial the tracker itself, past the interface.
@@ -731,7 +732,7 @@ func (fm *FetcherManager) Close() error {
 
 // ApplyConfig sets the upload limit, the network interface and the listening port
 // on running torrents. DHT and PEX are fixed when the client is built, and so are
-// UPnP, WebRTC and the address families, which follow the interface; an idle client
+// UPnP and the address families, which follow the interface; an idle client
 // is closed and rebuilt by the next task.
 func (fm *FetcherManager) ApplyConfig(getConfig func(v any)) {
 	var c config
