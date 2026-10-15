@@ -15,6 +15,7 @@ require (
 	github.com/matoous/go-nanoid/v2 v2.0.0
 	github.com/mattn/go-ieproxy v0.0.12
 	github.com/mholt/archives v0.1.5
+	github.com/monkeyWie/goed2k v0.0.0-20260317100435-7a7575cf2447
 	github.com/pkg/errors v0.9.1
 	github.com/rs/dnscache v0.0.0-20230804202142-fc85eb664529
 	github.com/rs/zerolog v1.31.0
@@ -44,7 +45,6 @@ require (
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/mikelolasagasti/xz v1.0.1 // indirect
 	github.com/minio/minlz v1.0.1 // indirect
-	github.com/monkeyWie/goed2k v0.0.0-20260317100435-7a7575cf2447 // indirect
 	github.com/nwaples/rardecode/v2 v2.2.0 // indirect
 	github.com/onsi/ginkgo/v2 v2.23.4 // indirect
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
@@ -66,11 +66,10 @@ require (
 	dario.cat/mergo v1.0.0 // indirect
 	github.com/Microsoft/go-winio v0.6.1
 	github.com/ProtonMail/go-crypto v0.0.0-20230717121422-5aa5874ade95 // indirect
-	github.com/RoaringBitmap/roaring v1.9.4 // indirect
 	github.com/acomagu/bufpipe v1.0.4 // indirect
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
 	github.com/anacrolix/chansync v0.8.0 // indirect
-	github.com/anacrolix/dht/v2 v2.23.1-0.20260525063928-ec3a9bd99456 // indirect
+	github.com/anacrolix/dht/v2 v2.23.1-0.20260525063928-ec3a9bd99456
 	github.com/anacrolix/envpprof v1.5.0 // indirect
 	github.com/anacrolix/generics v0.2.0 // indirect
 	github.com/anacrolix/go-libutp v1.5.0 // indirect
@@ -164,4 +163,4 @@ require (
 )
 
 // Fixes to anacrolix/torrent that upstream does not have yet, see KNIGHTLOADER.md.
-replace github.com/anacrolix/torrent => github.com/junkerderprovinz/torrent v1.61.1-0.20261003180733-174c1310bcc0
+replace github.com/anacrolix/torrent => github.com/junkerderprovinz/torrent v1.61.1-0.20261014215729-7f7e9bdefc17
