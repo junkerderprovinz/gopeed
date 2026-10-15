@@ -31,6 +31,13 @@ const (
 	// When a connection finishes its chunk, it can "steal" work from slow connections.
 	stealThresholdSeconds = 3          // Only steal if victim needs > 3 seconds to finish
 	stealMinChunkSize     = 512 * 1024 // Min steal size: 512KB (avoid tiny chunks)
+
+	// helpInterval is how often a connection without work looks again for one
+	// that has fallen behind.
+	helpInterval = time.Second
+	// quietAfter is how long a connection may receive nothing before its last
+	// measured speed no longer counts.
+	quietAfter = 2 * time.Second
 )
 
 // ============================================================================
@@ -966,7 +973,7 @@ func (f *Fetcher) runConnection(conn *connection) {
 		if err == nil {
 			// A connection a reader took away must not pick up other work on
 			// its way out.
-			if !f.meta.Res.Range || conn.ctx.Err() != nil || !f.helpOtherConnection(conn) {
+			if !f.meta.Res.Range || conn.ctx.Err() != nil || !f.awaitHelp(conn) {
 				f.connMu.Lock()
 				conn.Completed = true
 				conn.State = connCompleted
@@ -1599,6 +1606,50 @@ func (f *Fetcher) runConnectionFallback(conn *connection) {
 	}
 }
 
+// awaitHelp gives a connection that finished its chunk part of another's, and
+// while the others still fetch, keeps looking until one falls behind. One can
+// slow down long after the rest have finished, and would then fetch its
+// remainder alone.
+func (f *Fetcher) awaitHelp(helper *connection) bool {
+	for {
+		if f.helpOtherConnection(helper) {
+			return true
+		}
+		if !f.othersFetching(helper) {
+			return false
+		}
+		select {
+		case <-helper.ctx.Done():
+			return false
+		case <-time.After(helpInterval):
+		}
+	}
+}
+
+// othersFetching reports whether a connection other than helper still holds a
+// chunk large enough to be shared. Chunks only shrink, so once none does, none
+// will.
+func (f *Fetcher) othersFetching(helper *connection) bool {
+	f.connMu.Lock()
+	defer f.connMu.Unlock()
+	for _, c := range f.connections {
+		if c != helper && c.running && !c.Completed && c.Chunk.remain() >= stealMinChunkSize {
+			return true
+		}
+	}
+	return false
+}
+
+// currentSpeed is c's speed, or what it has received since its last
+// measurement when that was a while ago. Caller holds connMu.
+func currentSpeed(c *connection, now int64) int64 {
+	quiet := now - c.lastSpeedCheck
+	if c.lastSpeedCheck == 0 || quiet < int64(quietAfter) {
+		return c.speed
+	}
+	return min(c.speed, (c.Downloaded-c.lastSpeedDownload)*int64(time.Second)/quiet)
+}
+
 // helpOtherConnection implements work stealing: when a connection finishes its chunk,
 // it looks for connections that need more than stealThresholdSeconds to finish and steals half of its work.
 func (f *Fetcher) helpOtherConnection(helper *connection) bool {
@@ -1610,6 +1661,7 @@ func (f *Fetcher) helpOtherConnection(helper *connection) bool {
 	}
 
 	// Find the connection with longest remaining time
+	now := time.Now().UnixNano()
 	var slowestConn *connection
 	var maxRemainSeconds int64
 	for _, r := range f.connections {
@@ -1624,8 +1676,8 @@ func (f *Fetcher) helpOtherConnection(helper *connection) bool {
 
 		// Calculate remaining time in seconds for this connection
 		var remainSeconds int64
-		if r.speed > 0 {
-			remainSeconds = remain / r.speed
+		if speed := currentSpeed(r, now); speed > 0 {
+			remainSeconds = remain / speed
 		} else {
 			// Speed unknown, assume it needs help if chunk is large enough
 			remainSeconds = stealThresholdSeconds + 1
@@ -1647,6 +1699,9 @@ func (f *Fetcher) helpOtherConnection(helper *connection) bool {
 	helper.Chunk.End = slowestConn.Chunk.End
 	helper.Chunk.Downloaded = 0
 	slowestConn.Chunk.End = helper.Chunk.Begin - 1
+	// The time spent waiting for work is not the helper going quiet.
+	helper.lastSpeedCheck = now
+	helper.lastSpeedDownload = helper.Downloaded
 	return true
 }
 
