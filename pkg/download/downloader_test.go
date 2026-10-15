@@ -2933,3 +2933,80 @@ func TestDownloader_ResolveContextClosesAResultNotCreatedWhenItEnds(t *testing.T
 		t.Error("Create() took a result whose context had ended")
 	}
 }
+
+// gatedCloser builds fetchers whose Close closes started and then waits for
+// release before it closes the fetcher and closes done.
+type gatedCloser struct {
+	fetcher.FetcherManager
+	started, release, done chan struct{}
+}
+
+func (g *gatedCloser) Build() fetcher.Fetcher {
+	return &gatedClosing{g.FetcherManager.Build(), g}
+}
+
+type gatedClosing struct {
+	fetcher.Fetcher
+	g *gatedCloser
+}
+
+func (f *gatedClosing) Close() error {
+	close(f.g.started)
+	<-f.g.release
+	err := f.Fetcher.Close()
+	close(f.g.done)
+	return err
+}
+
+func TestDownloader_DiscardWaitsForTheCloseTheEndedContextStarted(t *testing.T) {
+	gate := &gatedCloser{
+		FetcherManager: new(bt.FetcherManager),
+		started:        make(chan struct{}),
+		release:        make(chan struct{}),
+		done:           make(chan struct{}),
+	}
+	downloader := NewDownloader(&DownloaderConfig{
+		FetchManagers: []fetcher.FetcherManager{gate},
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rr, err := downloader.ResolveContext(ctx, &base.Request{URL: "../../internal/protocol/bt/testdata/test.torrent"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-gate.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the ended context did not close the result")
+	}
+	if _, err := downloader.Create(rr.ID); err == nil {
+		t.Error("Create() took a result that is being closed")
+	}
+
+	discarded := make(chan struct{})
+	go func() {
+		downloader.Discard(rr.ID)
+		close(discarded)
+	}()
+	select {
+	case <-discarded:
+		t.Fatal("Discard() returned while the fetcher was still being closed")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(gate.release)
+	select {
+	case <-discarded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Discard() did not return once the fetcher was closed")
+	}
+	select {
+	case <-gate.done:
+	default:
+		t.Error("Discard() returned before the fetcher was closed")
+	}
+}
