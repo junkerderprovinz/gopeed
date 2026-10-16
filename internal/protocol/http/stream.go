@@ -61,6 +61,12 @@ func (c *connection) writePos() int64 {
 	return c.Chunk.Begin + c.Chunk.Downloaded
 }
 
+// gaveUp reports whether c stopped for good on an error it does not retry,
+// such as a host's 403 for one connection too many.
+func (c *connection) gaveUp() bool {
+	return c.State == connFailed && c.failed && !c.running
+}
+
 func (c *connection) active() bool {
 	return c.running && !c.parked
 }
@@ -193,10 +199,10 @@ func (f *Fetcher) focus(pos int64) {
 }
 
 // adoptParkedLocked hands helper the unwritten rest of a parked connection's
-// range.
+// range, or of one that gave up on it.
 func (f *Fetcher) adoptParkedLocked(helper *connection) bool {
 	for _, p := range f.connections {
-		if p == helper || !p.parked || p.running || p.Chunk.remain() <= 0 {
+		if p == helper || !(p.parked || p.gaveUp()) || p.running || p.Chunk.remain() <= 0 {
 			continue
 		}
 		helper.Chunk.Begin = p.writePos()
@@ -204,6 +210,7 @@ func (f *Fetcher) adoptParkedLocked(helper *connection) bool {
 		helper.Chunk.Downloaded = 0
 		p.Chunk.End = helper.Chunk.Begin - 1
 		p.parked = false
+		p.failed = false
 		p.Completed = true
 		p.State = connCompleted
 		return true

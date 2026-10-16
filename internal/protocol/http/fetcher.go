@@ -1627,13 +1627,16 @@ func (f *Fetcher) awaitHelp(helper *connection) bool {
 }
 
 // othersFetching reports whether a connection other than helper still holds a
-// chunk large enough to be shared. Chunks only shrink, so once none does, none
-// will.
+// chunk large enough to be shared, or one it gave up on. Chunks only shrink,
+// so once none does, none will.
 func (f *Fetcher) othersFetching(helper *connection) bool {
 	f.connMu.Lock()
 	defer f.connMu.Unlock()
 	for _, c := range f.connections {
-		if c != helper && c.running && !c.Completed && c.Chunk.remain() >= stealMinChunkSize {
+		if c == helper || c.Completed {
+			continue
+		}
+		if c.running && c.Chunk.remain() >= stealMinChunkSize || c.gaveUp() && c.Chunk.remain() > 0 {
 			return true
 		}
 	}
@@ -1813,14 +1816,6 @@ func (f *Fetcher) onDownloadComplete() {
 		}
 
 		if needsMoreData && !conn.Completed && conn.State != connCompleted {
-			// This connection has remaining work and isn't done
-			// Check if it failed with 403 (server limit) - these can be ignored if other connections completed the work
-			if conn.State == connFailed && conn.failed {
-				if re := extractRequestError(conn.lastErr); re != nil && re.Code == 403 {
-					// 403 is server connection limit, check if other connections will complete this chunk
-					continue
-				}
-			}
 			allChunksComplete = false
 			break
 		}
@@ -1829,15 +1824,12 @@ func (f *Fetcher) onDownloadComplete() {
 	// If total downloaded matches file size, consider it a success regardless of connection failures
 	downloadComplete := f.meta.Res.Size > 0 && totalDownloaded >= f.meta.Res.Size
 
-	// Check for any errors, but ignore 403 (server connection limit) errors if download completed
+	// A connection that gave up with its range taken over is completed by now,
+	// so any failed one left holds bytes nobody fetched.
 	var finalErr error
 	if !downloadComplete && !allChunksComplete {
 		for _, conn := range f.connections {
 			if conn.State == connFailed && conn.failed {
-				// Skip 403 errors (server connection limit) - these are expected when exceeding server's limit
-				if re := extractRequestError(conn.lastErr); re != nil && re.Code == 403 {
-					continue
-				}
 				if re := extractRequestError(conn.lastErr); re != nil {
 					finalErr = fmt.Errorf("connection %d failed: retries=%d, status=%d", conn.ID, conn.retryTimes, re.Code)
 				} else if conn.lastErr != nil {

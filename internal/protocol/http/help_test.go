@@ -2,6 +2,7 @@ package http
 
 import (
 	"bytes"
+	"fmt"
 	gohttp "net/http"
 	"net/http/httptest"
 	"sync"
@@ -101,5 +102,63 @@ func TestFetcher_FinishedConnectionHelpsOneThatSlowsDownLater(t *testing.T) {
 	}
 	if afterSlowdown.Load() == 0 {
 		t.Fatal("no connection came back for the range of the one that slowed down")
+	}
+}
+
+// A host that caps connections answers the one too many with 403, and that
+// connection gives up. Its range goes to a connection that is free, and the
+// file is not finished with the range missing.
+func TestFetcher_RangeOfAConnectionThatGaveUpIsTakenOver(t *testing.T) {
+	data := randomData(t, 8<<20)
+	var refused atomic.Bool
+	srv := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		var from int
+		_, _ = fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-", &from)
+		if from >= len(data)/2 && refused.CompareAndSwap(false, true) {
+			gohttp.Error(w, "too many connections", gohttp.StatusForbidden)
+			return
+		}
+		gohttp.ServeContent(slowAfter{w, 2 * time.Millisecond, nil}, r, "flaky.data", time.Time{}, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+
+	got := fetchWithMirrors(t, 2, srv.URL+"/flaky.data")
+	if !bytes.Equal(got, data) {
+		t.Fatal("the file differs from the source")
+	}
+	if !refused.Load() {
+		t.Fatal("the server never refused the second connection")
+	}
+}
+
+// A range that every connection was refused leaves the download failed, not
+// finished with that range missing.
+func TestFetcher_RangeNobodyMayFetchFailsTheDownload(t *testing.T) {
+	data := randomData(t, 8<<20)
+	srv := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		var from int
+		_, _ = fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-", &from)
+		if from >= len(data)/2 {
+			gohttp.Error(w, "too many connections", gohttp.StatusForbidden)
+			return
+		}
+		gohttp.ServeContent(slowAfter{w, 2 * time.Millisecond, nil}, r, "capped.data", time.Time{}, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+
+	f := buildFetcher()
+	err := f.Resolve(&base.Request{URL: srv.URL + "/capped.data"}, &base.Options{
+		Name:  "capped.data",
+		Path:  t.TempDir(),
+		Extra: &http.OptsExtra{Connections: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Wait(); err == nil {
+		t.Fatal("the download finished with half of the file never fetched")
 	}
 }
