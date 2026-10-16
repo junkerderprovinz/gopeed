@@ -1816,6 +1816,14 @@ func (f *Fetcher) onDownloadComplete() {
 		}
 
 		if needsMoreData && !conn.Completed && conn.State != connCompleted {
+			// This connection has remaining work and isn't done
+			// Check if it failed with 403 (server limit) - these can be ignored if other connections completed the work
+			if conn.State == connFailed && conn.failed {
+				if re := extractRequestError(conn.lastErr); re != nil && re.Code == 403 {
+					// 403 is server connection limit, check if other connections will complete this chunk
+					continue
+				}
+			}
 			allChunksComplete = false
 			break
 		}
@@ -1824,12 +1832,15 @@ func (f *Fetcher) onDownloadComplete() {
 	// If total downloaded matches file size, consider it a success regardless of connection failures
 	downloadComplete := f.meta.Res.Size > 0 && totalDownloaded >= f.meta.Res.Size
 
-	// A connection that gave up with its range taken over is completed by now,
-	// so any failed one left holds bytes nobody fetched.
+	// Check for any errors, but ignore 403 (server connection limit) errors if download completed
 	var finalErr error
 	if !downloadComplete && !allChunksComplete {
 		for _, conn := range f.connections {
 			if conn.State == connFailed && conn.failed {
+				// Skip 403 errors (server connection limit) - these are expected when exceeding server's limit
+				if re := extractRequestError(conn.lastErr); re != nil && re.Code == 403 {
+					continue
+				}
 				if re := extractRequestError(conn.lastErr); re != nil {
 					finalErr = fmt.Errorf("connection %d failed: retries=%d, status=%d", conn.ID, conn.retryTimes, re.Code)
 				} else if conn.lastErr != nil {

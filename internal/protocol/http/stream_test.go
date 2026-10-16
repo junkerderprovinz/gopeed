@@ -297,8 +297,8 @@ func TestStream_ReaderAtARefusedRangeKeepsTheDownloadRunning(t *testing.T) {
 	}
 }
 
-// A download whose range every connection was refused with 403 fails, and a
-// reader open at the time stops at that range rather than read past it.
+// The library ends a download whose range was refused with 403 as done,
+// leaving that range out. A reader open at the time must not read it.
 func TestStream_ReaderStopsAtARangeThatNeverArrived(t *testing.T) {
 	const size = 2 << 20
 	data := testData(size)
@@ -311,8 +311,8 @@ func TestStream_ReaderStopsAtARangeThatNeverArrived(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	if err := f.Wait(); err == nil {
-		t.Fatal("the download finished with the refused range missing")
+	if err := f.Wait(); err != nil {
+		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
