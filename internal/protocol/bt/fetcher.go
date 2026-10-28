@@ -598,9 +598,27 @@ func (f *Fetcher) addTorrentSpec(spec *torrent.TorrentSpec) (err error) {
 		TorrentDirMaker: func(baseDir string, info *metainfo.Info, infoHash metainfo.Hash) string {
 			return f.meta.Opts.Path
 		},
+		FilePathMaker: confinedFilePath,
 	})
 	f.torrent, _, err = client.AddTorrentSpec(spec)
 	return
+}
+
+// confinedFilePath is the storage's default file path for a file that stays in
+// the torrent's folder. Any other gets a path outside the download folder,
+// which the storage refuses before it creates the torrent's empty files.
+func confinedFilePath(opts storage.FilePathMakerOpts) string {
+	var parts []string
+	if name := opts.Info.BestName(); name != metainfo.NoName {
+		parts = append(parts, name)
+	}
+	parts = append(parts, opts.File.BestPath()...)
+	for _, p := range parts {
+		if p == ".." || strings.ContainsAny(p, `/\`) {
+			return ".."
+		}
+	}
+	return filepath.Join(parts...)
 }
 
 func (f *Fetcher) seedRadio() float64 {
